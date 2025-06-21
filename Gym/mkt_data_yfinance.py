@@ -10,6 +10,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # TODO: cache data locally and check for cache before downloading
+# TEST
 
 class MarketDataLoader:
     """A class to handle market data loading and processing using Yahoo Finance."""
