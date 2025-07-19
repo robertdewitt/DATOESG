@@ -7,123 +7,137 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def plot_orders(orders, num_orders=3):
+def plot_orders(orders_dict, num_orders=3):
     """
-    Plots the order information including prices, quantities, and action percentages.
-    @param orders: List of order information dictionaries.
-    Each dictionary should contain keys like 'ticker', 'side', 'time_horizon', 'order_qty',
+    Plots the order information including prices, quantities, and action percentages for multiple models.
+    @param orders_dict: Dictionary where keys are model names and values are lists of order information dictionaries.
+                       Can also accept a single list for backward compatibility.
+    @param num_orders: Number of orders to plot per model.
+    Each order dictionary should contain keys like 'ticker', 'side', 'time_horizon', 'order_qty',
     'current_step', 'mid_price', 'immediate_impact', 'action_percentage', 'accumulated_impact',
     'last_fill_price', 'vwap_price', 'order_vwap', 'total_reward', 'last_trade_size', and 'shares_remaining'.
     @return: None
-    """
-    for i, order_info in enumerate(orders[:num_orders]):
-        # Extract meta data for this order
-        ticker = order_info[0]["ticker"]
-        side = order_info[0]["side"]
-        time_horizon = order_info[0]["time_horizon"]
-        adv_val = order_info[0].get("adv", None)
-
-        if 'order_qty' in order_info[0]:
-            total_shares = order_info[0]['order_qty']
-        else:
-            total_shares = (order_info[0].get('shares_remaining', 0) +
-                          order_info[0].get('last_trade_size', 0))
-
-        # Create figure with 3 subplots
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    """ 
+    # Loop through each model
+    for model_name, orders in orders_dict.items():
+        print(f"\n=== Plotting orders for {model_name} ===")
         
-        # Set title for the entire figure
-        subtitle_parts = [
-            f"[{ticker} | {side.capitalize()}] Order {i+1}",
-            f"Total {total_shares:,.0f} Shares",
-            f"Horizon: {time_horizon}"
-        ]
-        if adv_val is not None:
-            subtitle_parts.append(f"ADV: {adv_val:,.0f}")
-        fig.suptitle(" | ".join(subtitle_parts), fontsize=14)
+        # Loop through orders for this model
+        for i, order_info in enumerate(orders[:num_orders]):
+            # Extract meta data for this order
+            ticker = order_info[0]["ticker"]
+            side = order_info[0]["side"]
+            time_horizon = order_info[0]["time_horizon"]
+            adv_val = order_info[0].get("adv", None)
+            order_date = order_info[0].get("date", None)
 
-        # Plot 1: Prices
-        ax1.set_ylabel("Price", color="blue")
-        times = [x["current_step"] for x in order_info]
-        mid_prices = [x["mid_price"] for x in order_info]
-        
-        # Convert to bps and percentages
-        immediate_impact = [x.get("immediate_impact", 0) * 10000 for x in order_info]
-        action_percentages = [x.get("action_percentage", 0) * 100 for x in order_info]
-        accumulated_impacts = [x.get("accumulated_impact", np.nan) * 10000 for x in order_info]
+            if 'order_qty' in order_info[0]:
+                total_shares = order_info[0]['order_qty']
+            else:
+                total_shares = (order_info[0].get('shares_remaining', 0) +
+                              order_info[0].get('last_trade_size', 0))
 
-        fill_prices = [x.get("last_fill_price", np.nan) for x in order_info]
-        vwap_prices = [x.get("vwap_price", np.nan) for x in order_info]
-        order_vwap = [x.get("order_vwap", np.nan) for x in order_info]
-        total_rewards = [x.get("total_reward", np.nan) for x in order_info]
+            # Create figure with 3 subplots
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+            
+            # Set title for the entire figure
+            subtitle_parts = [
+                f"{model_name}",
+                f"[{ticker} | {side.capitalize()}] Order {i+1}",
+                f"Total {total_shares:,.0f} Shares",
+                f"Horizon: {time_horizon}"
+            ]
+            if adv_val is not None:
+                subtitle_parts.append(f"ADV: {adv_val:,.0f}")
+            fig.suptitle(" | ".join(subtitle_parts), fontsize=14)
 
-        ax1.plot(times, fill_prices, label="Fill Price", color="blue")
-        ax1.plot(times, vwap_prices, label="Market VWAP Price", color="green")
-        ax1.plot(times, order_vwap, label="Order VWAP Price", color="purple", linestyle="--")
-        ax1.grid(True)
-       
-        # Add reward on secondary y-axis
-        ax1_reward = ax1.twinx()
-        ax1_reward.set_ylabel("Total Reward", color="red")
-        ax1_reward.plot(times, total_rewards, label="Total Reward", color="red", linestyle=":")
-        
-        # Combine legends
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax1_reward.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            # Plot 1: Prices
+            ax1.set_ylabel("Price", color="blue")
+            times = [x["current_step"] for x in order_info]
+            mid_prices = [x["mid_price"] for x in order_info]
+            
+            # Convert to bps and percentages
+            immediate_impact = [x.get("immediate_impact", 0) * 10000 for x in order_info]
+            action_percentages = [x.get("action_percentage", 0) * 100 for x in order_info]
+            accumulated_impacts = [x.get("accumulated_impact", np.nan) * 10000 for x in order_info]
 
-        # Plot 2: Quantities
-        ax2.set_ylabel("Quantity", color="red")
-        trade_sizes = [x["last_trade_size"] for x in order_info]
-        shares_remaining = [x["shares_remaining"] for x in order_info]
+            # Filter out zero and invalid prices
+            fill_prices = [x.get("last_fill_price", np.nan) if x.get("last_fill_price", 0) > 0 else np.nan for x in order_info]
+            vwap_prices = [x.get("vwap_price", np.nan) if x.get("vwap_price", 0) > 0 else np.nan for x in order_info]
+            order_vwap = [x.get("order_vwap", np.nan) if x.get("order_vwap", 0) > 0 else np.nan for x in order_info]
+            total_rewards = [x.get("total_reward", np.nan) for x in order_info]
 
-        ax2.plot(times, shares_remaining, label="Shares Remaining", color="orange", linestyle="--")
-        ax2.grid(True)
-          
-        # Add trade size on secondary y-axis
-        ax2_trade = ax2.twinx()
-        ax2_trade.set_ylabel("Trade Size", color="red")
-        ax2_trade.scatter(times, trade_sizes, label="Trade Size", color="red", marker="o")
-        
-        # Combine legends
-        lines1, labels1 = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2_trade.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            # Only plot if we have valid prices
+            if any(not np.isnan(p) for p in fill_prices):
+                ax1.plot(times, fill_prices, label="Fill Price", color="blue")
+            if any(not np.isnan(p) for p in vwap_prices):
+                ax1.plot(times, vwap_prices, label="Market VWAP Price", color="green")
+            if any(not np.isnan(p) for p in order_vwap):
+                ax1.plot(times, order_vwap, label="Order VWAP Price", color="purple", linestyle="--")
+            ax1.grid(True)
+           
+            # Add reward on secondary y-axis
+            ax1_reward = ax1.twinx()
+            ax1_reward.set_ylabel("Total Reward", color="red")
+            ax1_reward.plot(times, total_rewards, label="Total Reward", color="red", linestyle=":")
+            
+            # Combine legends
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax1_reward.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
 
-        # Plot 3: Action Percentage
-        ax3.set_ylabel("Action %", color="green")
-        ax3.set_xlabel("Time (minutes)")
-        action_percentages = [x.get("action_percentage", 0) * 100 for x in order_info]
-        ax3.plot(times, action_percentages, label="Action %", color="green")
-        ax3.grid(True)
-        
-        # Add accumulated impact on secondary y-axis
-        ax3_impact = ax3.twinx()
-        ax3_impact.set_ylabel("Accumulated Impact (bps)", color="purple")
-        ax3_impact.plot(times, accumulated_impacts, label="Accumulated Impact (bps)",
-                       color="purple", linestyle="--")
-        ax3_impact.scatter(times, immediate_impact, label="Immediate Impact (bps)",
-                          color="brown", marker="x")
-        
-        # Combine legends
-        lines1, labels1 = ax3.get_legend_handles_labels()
-        lines2, labels2 = ax3_impact.get_legend_handles_labels()
-        ax3.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            # Plot 2: Quantities
+            ax2.set_ylabel("Quantity", color="red")
+            trade_sizes = [x["last_trade_size"] for x in order_info]
+            shares_remaining = [x["shares_remaining"] for x in order_info]
 
-        # Set x-axis limits to show full horizon
-        ax1.set_xlim(0, time_horizon)
-        
-        # Add vertical line at order completion time
-        if any((x.get("shares_remaining", None) == 0) for x in order_info):
-            completion_time = next(x["current_step"] for x in order_info if x.get("shares_remaining", None) == 0)
-            for ax in [ax1, ax2, ax3]:
-                ax.axvline(x=completion_time, color='gray', linestyle=':', alpha=0.5,
-                          label='Order Completed')
-                ax.legend()
+            ax2.plot(times, shares_remaining, label="Shares Remaining", color="orange", linestyle="--")
+            ax2.grid(True)
+              
+            # Add trade size on secondary y-axis
+            ax2_trade = ax2.twinx()
+            ax2_trade.set_ylabel("Trade Size", color="red")
+            ax2_trade.scatter(times, trade_sizes, label="Trade Size", color="red", marker="o")
+            
+            # Combine legends
+            lines1, labels1 = ax2.get_legend_handles_labels()
+            lines2, labels2 = ax2_trade.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, loc="best")
 
-        # Final layout/visualise
-        plt.tight_layout()
-        plt.show()
+            # Plot 3: Action Percentage
+            ax3.set_ylabel("Action %", color="green")
+            ax3.set_xlabel("Time (minutes)")
+            action_percentages = [x.get("action_percentage", 0) * 100 for x in order_info]
+            ax3.plot(times, action_percentages, label="Action %", color="green")
+            ax3.grid(True)
+            
+            # Add accumulated impact on secondary y-axis
+            ax3_impact = ax3.twinx()
+            ax3_impact.set_ylabel("Accumulated Impact (bps)", color="purple")
+            ax3_impact.plot(times, accumulated_impacts, label="Accumulated Impact (bps)",
+                           color="purple", linestyle="--")
+            ax3_impact.scatter(times, immediate_impact, label="Immediate Impact (bps)",
+                              color="brown", marker="x")
+            
+            # Combine legends
+            lines1, labels1 = ax3.get_legend_handles_labels()
+            lines2, labels2 = ax3_impact.get_legend_handles_labels()
+            ax3.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+            # Set x-axis limits to show full horizon
+            ax1.set_xlim(0, time_horizon)
+            
+            # Add vertical line at order completion time
+            if any((x.get("shares_remaining", None) == 0) for x in order_info):
+                completion_time = next(x["current_step"] for x in order_info if x.get("shares_remaining", None) == 0)
+                for ax in [ax1, ax2, ax3]:
+                    ax.axvline(x=completion_time, color='gray', linestyle=':', alpha=0.5,
+                              label='Order Completed')
+                    ax.legend()
+
+            # Final layout/visualise
+            plt.tight_layout()
+            plt.show()
 
 
 def display_order_info(orders_df, num_orders=3, name="Training"):
@@ -166,7 +180,7 @@ def display_order_info(orders_df, num_orders=3, name="Training"):
                     print(f"{key}: {float(val_out):,.0f}", end=' ')
                 except (ValueError, TypeError):
                     print(f"{key}: {val_out}", end=' ')
-            elif key == 'adv_pct':
+            elif (key == 'adv_pct') or (key == 'ehv_pct'):
                 print(f"{key}: {val:.2%}", end=' ')
             else:
                 print(f"{key}: {val}", end=' ')
@@ -177,7 +191,7 @@ def display_order_info(orders_df, num_orders=3, name="Training"):
     print("========================================")
 
 
-def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
+def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', b_name='Test'):
     """
     Plots histograms of order characteristics comparing train and test distributions.
     @param train_df: DataFrame containing training order information.
@@ -185,16 +199,16 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     @param date_col: Column name containing the date/time information.
     @return: None
     """
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     axes = axes.flatten()
 
     # Plot histograms for each characteristic
     plot_idx = 0
     
     # Order size distribution
-    axes[plot_idx].hist(train_df['order_qty'], bins=50, alpha=0.5, label='Train')
-    if test_df is not None:
-        axes[plot_idx].hist(test_df['order_qty'], bins=50, alpha=0.5, label='Test')
+    axes[plot_idx].hist(a_df['order_qty'], bins=50, alpha=0.5, label=a_name)
+    if b_df is not None:
+        axes[plot_idx].hist(b_df['order_qty'], bins=50, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Order Size Distribution')
     axes[plot_idx].set_xlabel('Order Size')
     axes[plot_idx].set_ylabel('Frequency')
@@ -202,9 +216,9 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     plot_idx += 1
 
     # Time horizon distribution
-    axes[plot_idx].hist(train_df['time_horizon'], bins=50, alpha=0.5, label='Train')
-    if test_df is not None:
-        axes[plot_idx].hist(test_df['time_horizon'], bins=50, alpha=0.5, label='Test')
+    axes[plot_idx].hist(a_df['time_horizon'], bins=50, alpha=0.5, label=a_name)
+    if b_df is not None:
+        axes[plot_idx].hist(b_df['time_horizon'], bins=50, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Time Horizon Distribution')
     axes[plot_idx].set_xlabel('Time Horizon (minutes)')
     axes[plot_idx].set_ylabel('Frequency')
@@ -212,9 +226,9 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     plot_idx += 1
 
     # ADV percentage distribution
-    axes[plot_idx].hist(train_df['adv_pct'], bins=50, alpha=0.5, label='Train')
-    if test_df is not None:
-        axes[plot_idx].hist(test_df['adv_pct'], bins=50, alpha=0.5, label='Test')
+    axes[plot_idx].hist(a_df['adv_pct'], bins=50, alpha=0.5, label=a_name)
+    if b_df is not None:
+        axes[plot_idx].hist(b_df['adv_pct'], bins=50, alpha=0.5, label=a_name)
     axes[plot_idx].set_title('ADV Percentage Distribution')
     axes[plot_idx].set_xlabel('ADV Percentage')
     axes[plot_idx].set_ylabel('Frequency')
@@ -222,11 +236,11 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     plot_idx += 1
 
     # Side distribution (buy/sell)
-    train_sides = train_df['side'].value_counts()
-    axes[plot_idx].bar(train_sides.index, train_sides.values, alpha=0.5, label='Train')
-    if test_df is not None:
-        test_sides = test_df['side'].value_counts()
-        axes[plot_idx].bar(test_sides.index, test_sides.values, alpha=0.5, label='Test')
+    train_sides = a_df['side'].value_counts()
+    axes[plot_idx].bar(train_sides.index, train_sides.values, alpha=0.5, label=a_name)
+    if b_df is not None:
+        test_sides = b_df['side'].value_counts()
+        axes[plot_idx].bar(test_sides.index, test_sides.values, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Order Side Distribution')
     axes[plot_idx].set_xlabel('Side')
     axes[plot_idx].set_ylabel('Count')
@@ -234,9 +248,9 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     plot_idx += 1
 
     # Volatility distribution
-    axes[plot_idx].hist(train_df['today_volatility'], bins=50, alpha=0.5, label='Train')
-    if test_df is not None:
-        axes[plot_idx].hist(test_df['today_volatility'], bins=50, alpha=0.5, label='Test')
+    axes[plot_idx].hist(a_df['today_volatility'], bins=50, alpha=0.5, label=a_name)
+    if b_df is not None:
+        axes[plot_idx].hist(b_df['today_volatility'], bins=50, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Daily Volatility Distribution')
     axes[plot_idx].set_xlabel('Daily Volatility')
     axes[plot_idx].set_ylabel('Frequency')
@@ -244,26 +258,161 @@ def plot_order_histograms(train_df, test_df=None, date_col='Datetime'):
     plot_idx += 1
 
     # Intra-order return distribution
-    axes[plot_idx].hist(train_df['intra_order_return'], bins=50, alpha=0.5, label='Train')
-    if test_df is not None:
-        axes[plot_idx].hist(test_df['intra_order_return'], bins=50, alpha=0.5, label='Test')
+    axes[plot_idx].hist(a_df['intra_order_return'], bins=50, alpha=0.5, label=a_name)
+    if b_df is not None:
+        axes[plot_idx].hist(b_df['intra_order_return'], bins=50, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Intra-order Return Distribution')
     axes[plot_idx].set_xlabel('Return')
     axes[plot_idx].set_ylabel('Frequency')
     axes[plot_idx].legend()
     plot_idx += 1
 
+    # Daily Volatility Box Plot
+    # Prepare data for box plots
+    a_df['date'] = pd.to_datetime(a_df['date'])
+    train_daily_vol = a_df.groupby(a_df['date'].dt.date)['today_volatility'].apply(list).to_dict()
+    
+    if b_df is not None:
+        b_df['date'] = pd.to_datetime(b_df['date'])
+        test_daily_vol = b_df.groupby(b_df['date'].dt.date)['today_volatility'].apply(list).to_dict()
+    
+    # Combine all dates and sort them
+    all_dates = sorted(set(train_daily_vol.keys()) | (set(test_daily_vol.keys()) if b_df is not None else set()))
+    
+    # Prepare data for box plot
+    volatility_data = []
+    colors = []
+    positions = []
+    
+    for i, date in enumerate(all_dates):
+        if date in train_daily_vol:
+            volatility_data.append(train_daily_vol[date])
+            colors.append('blue')
+            positions.append(i)
+        if b_df is not None and date in test_daily_vol:
+            volatility_data.append(test_daily_vol[date])
+            colors.append('orange')
+            positions.append(i + 0.3)  # Offset test data slightly
+    
+    # Create box plot
+    bp1 = axes[plot_idx].boxplot(volatility_data, positions=positions, widths=0.25, patch_artist=True)
+    
+    # Color the boxes
+    for patch, color in zip(bp1['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.5)
+    
+    axes[plot_idx].set_title('Daily Volatility by Date')
+    axes[plot_idx].set_xlabel('Date')
+    axes[plot_idx].set_ylabel('Daily Volatility')
+    axes[plot_idx].set_xticks(range(len(all_dates)))
+    axes[plot_idx].set_xticklabels([str(d) for d in all_dates], rotation=45, ha='right')
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    
+    if b_df is None:
+        legend_elements = [Patch(facecolor='blue', alpha=0.5, label=a_name)]
+    else:
+        legend_elements = [Patch(facecolor='blue', alpha=0.5, label=a_name),
+                      Patch(facecolor='orange', alpha=0.5, label=b_name)]
+    axes[plot_idx].legend(handles=legend_elements)
+    plot_idx += 1
+
+    # Intra-order Return Box Plot
+    # Prepare data for box plots
+    train_daily_returns = a_df.groupby(a_df['date'].dt.date)['intra_order_return'].apply(list).to_dict()
+    
+    if b_df is not None:
+        test_daily_returns = b_df.groupby(b_df['date'].dt.date)['intra_order_return'].apply(list).to_dict()
+    
+    # Prepare data for box plot
+    returns_data = []
+    colors = []
+    positions = []
+    
+    for i, date in enumerate(all_dates):
+        if date in train_daily_returns:
+            returns_data.append(train_daily_returns[date])
+            colors.append('blue')
+            positions.append(i)
+        if b_df is not None and date in test_daily_returns:
+            returns_data.append(test_daily_returns[date])
+            colors.append('orange')
+            positions.append(i + 0.3)  # Offset test data slightly
+    
+    # Create box plot
+    bp2 = axes[plot_idx].boxplot(returns_data, positions=positions, widths=0.25, patch_artist=True)
+    
+    # Color the boxes
+    for patch, color in zip(bp2['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.5)
+    
+    axes[plot_idx].set_title('Intra-order Returns by Date')
+    axes[plot_idx].set_xlabel('Date')
+    axes[plot_idx].set_ylabel('Intra-order Return')
+    axes[plot_idx].set_xticks(range(len(all_dates)))
+    axes[plot_idx].set_xticklabels([str(d) for d in all_dates], rotation=45, ha='right')
+    
+    # Add legend
+    axes[plot_idx].legend(handles=legend_elements)
+    plot_idx += 1
+
+    # ADV Percentage Box Plot
+    # Prepare data for box plots
+    train_daily_adv_pct = a_df.groupby(a_df['date'].dt.date)['adv_pct'].apply(list).to_dict()
+    
+    if b_df is not None:
+        test_daily_adv_pct = b_df.groupby(b_df['date'].dt.date)['adv_pct'].apply(list).to_dict()
+    
+    # Prepare data for box plot
+    adv_pct_data = []
+    colors = []
+    positions = []
+    
+    for i, date in enumerate(all_dates):
+        if date in train_daily_adv_pct:
+            # Convert to percentage for display
+            adv_pct_data.append([x * 100 for x in train_daily_adv_pct[date]])
+            colors.append('blue')
+            positions.append(i)
+        if b_df is not None and date in test_daily_adv_pct:
+            # Convert to percentage for display
+            adv_pct_data.append([x * 100 for x in test_daily_adv_pct[date]])
+            colors.append('orange')
+            positions.append(i + 0.3)  # Offset test data slightly
+    
+    # Create box plot
+    bp3 = axes[plot_idx].boxplot(adv_pct_data, positions=positions, widths=0.25, patch_artist=True)
+    
+    # Color the boxes
+    for patch, color in zip(bp3['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.5)
+    
+    axes[plot_idx].set_title('ADV Percentage by Date')
+    axes[plot_idx].set_xlabel('Date')
+    axes[plot_idx].set_ylabel('ADV Percentage (%)')
+    axes[plot_idx].set_xticks(range(len(all_dates)))
+    axes[plot_idx].set_xticklabels([str(d) for d in all_dates], rotation=45, ha='right')
+    
+    # Add legend
+    axes[plot_idx].legend(handles=legend_elements)
+    plot_idx += 1
+
     plt.tight_layout()
     plt.show()
 
 
-def create_execution_summary_table(train_orders, test_orders=None, trim=0):
+def create_execution_summary_table(orders_dict, trim=0):
     """
-    Creates a summary table of key execution metrics for train and test orders.
-    @param train_orders: List of order information dictionaries for training data
-    @param test_orders: Optional list of order information dictionaries for test data
+    Creates a summary table of key execution metrics for multiple models/datasets.
+    @param orders_dict: Dictionary where keys are model/dataset names and values are lists of order information dictionaries.
+    @param trim: Trimming parameter for slippage (e.g., 0.01 for 1% top and bottom trim)
     @return: None (prints the table)
     """
+    
     def calculate_metrics(orders):
         # Initialize metrics
         total_notional = 0
@@ -275,11 +424,20 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
         slippages = []
         durations = []
         returns = []
+        incomplete_orders = 0
+        total_orders = len(orders)
+        
+        # For trimming, we need to collect slippages with their notional weights
+        slippage_notional_pairs = []
         
         for order_info in orders:
             # Get the first and last step info
             first_step = order_info[0]
             last_step = order_info[-1]
+            
+            # Check if order is incomplete (shares_remaining > 0)
+            if last_step.get('shares_remaining', 0) > 0:
+                incomplete_orders += 1
             
             # Calculate order notional value assuming all currency is the same (USD in this case)
             notional = first_step['order_qty'] * last_step['order_vwap']
@@ -290,12 +448,21 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
             rewards.append(total_reward)
             
             # Calculate slippage (VWAP vs arrival price)
-            slippage = (last_step['order_vwap'] - first_step['arrival_price']) / first_step['arrival_price']
-            weighted_slippage += slippage * notional
-            # side adjustment for slippage direction
-            if first_step['side'] == 'sell':
-                slippage *= -1
+            arrival_price = first_step.get('arrival_price', 0)
+            if arrival_price and arrival_price != 0:
+                slippage = (arrival_price - last_step['order_vwap']) / arrival_price
+                # side adjustment for slippage direction
+                if first_step['side'] == 'sell':
+                    slippage = -slippage
+            else:
+                # Undefined arrival price – set slippage to 0 and warn once
+                slippage = 0.0
+                if 'SLIPPAGE_WARNED' not in globals():
+                    print("⚠️  Warning: arrival_price was 0 for at least one order; slippage set to 0 to avoid division-by-zero.")
+                    globals()['SLIPPAGE_WARNED'] = True
+                
             slippages.append(slippage)
+            slippage_notional_pairs.append((slippage, notional))
             
             # Calculate completion duration ratio  
             # first time when shares_remaining is 0
@@ -310,7 +477,6 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
             durations.append(duration_ratio)
             
             # Calculate intra-order return
-            # find last fill price in order  which is last_order_price > 0
             intra_return = (last_step['mid_price'] - first_step['arrival_price']) / first_step['arrival_price']
             weighted_return += intra_return * notional
             returns.append(intra_return)
@@ -320,13 +486,43 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
                 if 'action_percentage' in step:
                     action_percentages.append(step['action_percentage'])
         
-        # Normalize by total notional
+        # Apply trimming to slippage calculation
+        if trim > 0 and len(slippage_notional_pairs) > 0:
+            # Sort by slippage values
+            sorted_pairs = sorted(slippage_notional_pairs, key=lambda x: x[0])
+            
+            # Calculate cumulative notional weights
+            total_notional_for_trim = sum(pair[1] for pair in sorted_pairs)
+            
+            # Find trim boundaries based on notional weights
+            lower_trim_notional = total_notional_for_trim * trim
+            upper_trim_notional = total_notional_for_trim * (1 - trim)
+            
+            cumulative_notional = 0
+            trimmed_pairs = []
+            
+            for slippage, notional in sorted_pairs:
+                cumulative_notional += notional
+                # Keep only the middle portion (exclude top and bottom trim percentiles)
+                if lower_trim_notional <= cumulative_notional <= upper_trim_notional:
+                    trimmed_pairs.append((slippage, notional))
+            
+            # Calculate weighted slippage from trimmed data
+            if trimmed_pairs:
+                trimmed_total_notional = sum(pair[1] for pair in trimmed_pairs)
+                weighted_slippage = sum(slippage * notional for slippage, notional in trimmed_pairs) / trimmed_total_notional
+            else:
+                weighted_slippage = 0
+        else:
+            # No trimming - use all data
+            weighted_slippage = sum(slippage * notional for slippage, notional in slippage_notional_pairs) / total_notional if total_notional > 0 else 0
+        
+        # Normalize other metrics by total notional (using original total_notional, not trimmed)
         if total_notional > 0:
-            weighted_slippage /= total_notional
             weighted_duration /= total_notional
             weighted_return /= total_notional
         
-        # Calculate standard deviations
+        # Calculate standard deviations (using all data, not trimmed)
         slippage_std = np.std(slippages) * 10000 if slippages else 0  # Convert to bps
         duration_std = np.std(durations) if durations else 0
         return_std = np.std(returns) * 10000 if returns else 0  # Convert to bps
@@ -336,6 +532,9 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
         # Calculate mean action percentage
         mean_action = np.mean(action_percentages) * 100 if action_percentages else 0  # Convert to percentage
         mean_reward = np.mean(rewards) * 10000 if rewards else 0  # Convert to bps
+        
+        # Calculate percentage of incomplete orders
+        incomplete_pct = (incomplete_orders / total_orders * 100) if total_orders > 0 else 0
         
         return {
             'Weighted Slippage (bps)': weighted_slippage * 10000,  # Convert to basis points
@@ -347,20 +546,34 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
             'Mean Reward (bps)': mean_reward,  # Already in bps
             'Reward Std Dev (bps)': reward_std,
             'Mean Action %': mean_action,
-            'Action % Std Dev': action_std
+            'Action % Std Dev': action_std,
+            'Incomplete Orders %': incomplete_pct
         }
     
-    # Calculate metrics for train and test
-    train_metrics = calculate_metrics(train_orders)
+    # Calculate metrics for all models
+    all_metrics = {}
+    model_names = list(orders_dict.keys())
+    
+    for model_name, orders in orders_dict.items():
+        all_metrics[model_name] = calculate_metrics(orders)
     
     # Create the table
     print("\nExecution Summary Table")
-    print("=" * 100)
+    print("=" * (30 + 16 * len(model_names) * 2))
+    
     # Print number of orders
-    print(f"Number of Orders - Train: {len(train_orders)}, Test: {len(test_orders) if test_orders else 'N/A'}")
-    print("-" * 100)
-    print(f"{'Metric':<30} {'Train':>15} {'Train Std':>15} {'Test':>15} {'Test Std':>15}")
-    print("-" * 100)
+    order_counts = " | ".join([f"{model}: {len(orders)}" for model, orders in orders_dict.items()])
+    print(f"Number of Orders - {order_counts}")
+    if trim > 0:
+        print(f"Slippage trimmed (top/bottom {trim:.1%} by notional weight)")
+    print("-" * (30 + 16 * len(model_names) * 2))
+    
+    # Create header with model names
+    header = f"{'Metric':<30}"
+    for model_name in model_names:
+        header += f"{model_name:>15} {model_name + ' Std':>15}"
+    print(header)
+    print("-" * (30 + 16 * len(model_names) * 2))
     
     # Define the metrics to display in order
     metrics = [
@@ -368,27 +581,28 @@ def create_execution_summary_table(train_orders, test_orders=None, trim=0):
         ('Weighted Duration Ratio', 'Duration Std Dev'),
         ('Weighted Intra-Order Return (bps)', 'Return Std Dev (bps)'),
         ('Mean Reward (bps)', 'Reward Std Dev (bps)'),
-        ('Mean Action %', 'Action % Std Dev')
+        ('Mean Action %', 'Action % Std Dev'),
+        ('Incomplete Orders %', None)  # No std dev for percentage
     ]
-    
-    # Calculate test metrics if available
-    test_metrics = calculate_metrics(test_orders) if test_orders else None
     
     # Display each metric pair
     for metric, std_metric in metrics:
-        train_value = f"{train_metrics[metric]:.2f}"
-        train_std = f"{train_metrics[std_metric]:.2f}"
+        row = f"{metric:<30}"
         
-        if test_metrics:
-            test_value = f"{test_metrics[metric]:.2f}"
-            test_std = f"{test_metrics[std_metric]:.2f}"
-        else:
-            test_value = "N/A"
-            test_std = "N/A"
+        for model_name in model_names:
+            model_metrics = all_metrics[model_name]
+            value = f"{model_metrics[metric]:.2f}"
+            if std_metric and std_metric in model_metrics:
+                std_value = f"{model_metrics[std_metric]:.2f}"
+                row += f"{value:>15} {std_value:>15}"
+            else:
+                # For metrics without std dev (like Incomplete Orders %), just show the value twice or add spacing
+                row += f"{value:>15} {'-':>15}"
             
-        print(f"{metric:<30} {train_value:>15} {train_std:>15} {test_value:>15} {test_std:>15}")
+        print(row)
     
-    print("=" * 100)
+    print("=" * (30 + 16 * len(model_names) * 2))
     print("Note: Slippage and Returns are in basis points (bps)")
     print("      Duration Ratio is completion time / total horizon")
     print("      Action percentages are in %")
+    print("      Incomplete Orders % shows orders not fully executed")

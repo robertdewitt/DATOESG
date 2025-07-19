@@ -106,3 +106,4 @@ def quick_setup(debug=True):
     setup_notebook_logging(level=level)
     disable_external_loggers()
     print(f"Logging configured at {logging.getLevelName(level)} level") 
+    return level

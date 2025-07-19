@@ -27,7 +27,7 @@ class MarketDataLoader:
         
         logger.debug("MarketDataLoader initialized")
     
-    def load_data(self, tickers, horizon='7d', interval='1m', dropna=True):
+    def load_data(self, tickers, horizon='60d', interval='1m', dropna=True):
         """
         Load market data for multiple tickers using yfinance.
         @param tickers: List of ticker symbols (e.g., ['AAPL', 'GOOGL']).
