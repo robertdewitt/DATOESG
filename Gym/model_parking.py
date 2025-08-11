@@ -2,9 +2,10 @@ import os
 import logging 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import CallbackList
 
 
-# this is a class for storing RL agents so that they can be looped through for training, testing, printing, etc.
+# this is a class for storing RL agents so that they can be looped through for training, testing, printing, callbacks to tensorboard,  etc.
 
 class ModelParking:
     def __init__(self, model_dir=None, cached=False,  models=None, env=None):
@@ -37,11 +38,15 @@ class ModelParking:
             os.makedirs(model_dir)
         
 
-    def park_model(self, model, model_name=None, save=True, learn=False, steps=1000):
+    def park_model(self, model, model_name=None, save=True, learn=False, steps=1000, callbacks=None):
         """
         Park the model for storage, also save the model to disc
         @param model: The model to add.
         @param model_name: Optional name for the model. If None, uses the class name.
+        @param save: Whether to save the model to disk.
+        @param learn: Whether to train the model.
+        @param steps: Number of training steps.
+        @param callbacks: List of callbacks to use during training.
         """
         if model_name is None:
             model_name = model.__class__.__name__
@@ -51,7 +56,15 @@ class ModelParking:
 
         if learn:
             logging.debug(f"Model '{model_name}' is learning for {steps} steps.")
-            model.learn(steps)
+            if callbacks:
+                # Create callback list if multiple callbacks provided
+                if isinstance(callbacks, list):
+                    callback_list = CallbackList(callbacks)
+                else:
+                    callback_list = callbacks
+                model.learn(steps, callback=callback_list)
+            else:
+                model.learn(steps)
         
         if save:
             model.save(f"{self.model_dir}/{model_name}")
@@ -80,17 +93,26 @@ class ModelParking:
         logging.debug(f"Parked models: {model_names}")
         return model_names
     
-    def model_learn(self, model_name, steps=1000):
+    def model_learn(self, model_name, steps=1000, callbacks=None):
         """
         Call the learn method of a parked model.
         @param model_name: Name of the model to learn from.
         @param steps: Number of steps for learning.
+        @param callbacks: List of callbacks to use during training.
         @return: Result of the learn method if successful, None otherwise.
         """
         model = self.get_model(model_name)
         if model is not None:
             logging.debug(f"Model '{model_name}' is learning for {steps} steps.")
-            return model.learn(steps)
+            if callbacks:
+                # Create callback list if multiple callbacks provided
+                if isinstance(callbacks, list):
+                    callback_list = CallbackList(callbacks)
+                else:
+                    callback_list = callbacks
+                return model.learn(steps, callback=callback_list)
+            else:
+                return model.learn(steps)
         
         logging.error(f"Cannot learn. Model '{model_name}' not found.")
         return None

@@ -27,9 +27,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         Initialize the Vectorized Optimal Execution Environment.
         
         @param stock_df_list: List of DataFrames containing stock data
-        @param orders_df: DataFrame containing orders
-        @param impact_coef: Immediate impact coefficient (γ)
-        @param decay_rate: Residual decay factor (κ)
+        @param orders_df: DataFrame containing orders (may include 'Y' and 'tau' columns for per-order parameters)
+        @param impact_coef: Immediate impact coefficient (γ) - used as fallback if orders_df lacks 'Y' column
+        @param decay_rate: Residual decay factor (κ) - used as fallback if orders_df lacks 'tau' column
         @param num_envs: Number of parallel environments
         @param min_rate: Minimum fraction of volume that can be traded
         @param max_rate: Maximum fraction of volume that can be traded
@@ -139,37 +139,62 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.last_trade_step = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.int32)
         self.total_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.total_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        
+        # Environment-specific propagator parameters (initialized with defaults, will be set in reset)
+        self.env_impact_coef = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.env_decay_rate = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
 
     def _preload_data_arrays(self):
-        """Convert all stock dataframes into tensors for faster access."""
+        """
+        Convert all stock dataframes into tensors for faster access.
+        """
         self.data_arrays = {}
         for ticker, df_raw in self.stock_df_list.items():
             if isinstance(df_raw.columns, pd.MultiIndex):
                 df = df_raw.xs(ticker, axis=1, level=1)
             else:
                 df = df_raw
-            
+        
+            # Helper function to handle NaN values
+            def safe_tensor(data, default_value=0.0):
+                arr = data.to_numpy(dtype=np.float32) if hasattr(data, 'to_numpy') else np.array(data, dtype=np.float32)
+                arr = np.nan_to_num(arr, nan=default_value)
+                return torch.tensor(arr, device=self.device)
+        
+            # Calculate VWAP with NaN protection
+            if 'vwap' in df.columns:
+                vwap_values = df['vwap'].to_numpy(dtype=np.float32)
+            else:
+                # Calculate from OHLC
+                vwap_values = ((df['trade_high'] + df['trade_low'] + df['trade_last']) / 3.0).to_numpy(dtype=np.float32)
+        
+            # Replace NaN VWAP values with mid price
+            mid_prices = ((df['trade_high'] + df['trade_low']) / 2.0).to_numpy(dtype=np.float32)
+            vwap_values = np.where(np.isnan(vwap_values), mid_prices, vwap_values)
+        
             self.data_arrays[ticker] = {
-                'High': torch.tensor(df['High'].to_numpy(dtype=np.float32), device=self.device),
-                'Low': torch.tensor(df['Low'].to_numpy(dtype=np.float32), device=self.device),
-                'Open': torch.tensor(df['Open'].to_numpy(dtype=np.float32), device=self.device),
-                'Close': torch.tensor(df['Close'].to_numpy(dtype=np.float32), device=self.device),
-                'Volume': torch.tensor(df['Volume'].to_numpy(dtype=np.float32), device=self.device),
-                'VWAP': torch.tensor(df['VWAP'].to_numpy(dtype=np.float32) if 'VWAP' in df.columns 
-                                   else ((df['High'] + df['Low'] + df['Close'] + df['Open']) / 4.0).to_numpy(dtype=np.float32), 
-                                   device=self.device),
-                'Signal': torch.tensor(df['Signal'].to_numpy(dtype=np.float32) if 'Signal' in df.columns 
-                                     else np.zeros(len(df), dtype=np.float32), device=self.device),
-                'Regime': torch.tensor(df['Regime'].to_numpy(dtype=np.float32) if 'Regime' in df.columns 
-                                     else np.zeros(len(df), dtype=np.float32), device=self.device),
-                'DailyVol': torch.tensor(df['DailyVol'].to_numpy(dtype=np.float32) if 'DailyVol' in df.columns 
-                                       else np.zeros(len(df), dtype=np.float32), device=self.device),
-                'DailyVolLag1': torch.tensor(df['DailyVolLag1'].to_numpy(dtype=np.float32) if 'DailyVolLag1' in df.columns 
-                                           else np.zeros(len(df), dtype=np.float32), device=self.device),
-                'DailyVol5d': torch.tensor(df['DailyVol5d'].to_numpy(dtype=np.float32) if 'DailyVol5d' in df.columns 
-                                         else np.zeros(len(df), dtype=np.float32), device=self.device),
-                'dates': df.index
+                'trade_high': safe_tensor(df['trade_high']),
+                'trade_low': safe_tensor(df['trade_low']),
+                'trade_last': safe_tensor(df['trade_last']),
+                'trade_volume': safe_tensor(df['trade_volume']),
+                'vwap': torch.tensor(vwap_values, device=self.device),
+                'Signal': safe_tensor(df['Signal'] if 'Signal' in df.columns else pd.Series(np.zeros(len(df)))),
+                'Regime': safe_tensor(df['Regime'] if 'Regime' in df.columns else pd.Series(np.zeros(len(df)))),
+                'daily_volatility': safe_tensor(
+                    df['daily_volatility'] if 'daily_volatility' in df.columns else pd.Series(np.full(len(df), 0.02)),
+                    default_value=0.02
+                ),
+                'daily_volatility_lag1': safe_tensor(
+                    df['daily_volatility_lag1'] if 'daily_volatility_lag1' in df.columns else pd.Series(np.full(len(df), 0.02)),
+                    default_value=0.02
+                ),
+                'daily_volatility_5d': safe_tensor(
+                    df['daily_volatility_5d'] if 'daily_volatility_5d' in df.columns else pd.Series(np.full(len(df), 0.02)),
+                    default_value=0.02
+                ),
+                'dates': pd.to_datetime(df.index) if not isinstance(df.index, pd.DatetimeIndex) else df.index
             }
+
 
     def reset(self, seed=None, options=None):
         """
@@ -218,6 +243,43 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.side = torch.tensor([1 if s.lower() == 'buy' else -1 for s in order_rows['side']], 
                                 device=self.device, dtype=torch.int8)
 
+        # Set environment-specific impact parameters from orders_df or use defaults
+        if 'Y' in order_rows.columns:
+            Y_values = order_rows['Y'].values
+            # Check for NaN values and replace with median
+            nan_mask = pd.isna(Y_values)
+            if nan_mask.any():
+                valid_values = Y_values[~nan_mask]
+                if len(valid_values) > 0:
+                    median_value = np.median(valid_values)
+                    logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
+                    Y_values = np.where(nan_mask, median_value, Y_values)
+                else:
+                    logger.warning(f"All Y values are NaN, using default {self.impact_coef.item()}")
+                    Y_values = np.full_like(Y_values, self.impact_coef.item())
+            self.env_impact_coef = torch.tensor(Y_values, device=self.device, dtype=torch.float32)
+        else:
+            # Use default impact coefficient for all environments
+            self.env_impact_coef = self.impact_coef.expand(self.num_envs)
+            
+        if 'tau' in order_rows.columns:
+            tau_values = order_rows['tau'].values
+            # Check for NaN values and replace with median
+            nan_mask = pd.isna(tau_values)
+            if nan_mask.any():
+                valid_values = tau_values[~nan_mask]
+                if len(valid_values) > 0:
+                    median_value = np.median(valid_values)
+                    logger.warning(f"Found {nan_mask.sum()} NaN tau values, replacing with median {median_value}")
+                    tau_values = np.where(nan_mask, median_value, tau_values)
+                else:
+                    logger.warning(f"All tau values are NaN, using default {self.decay_rate.item()}")
+                    tau_values = np.full_like(tau_values, self.decay_rate.item())
+            self.env_decay_rate = torch.tensor(tau_values, device=self.device, dtype=torch.float32)
+        else:
+            # Use default decay rate for all environments
+            self.env_decay_rate = self.decay_rate.expand(self.num_envs)
+
         # Handle dates for global indexing
         if 'date' in order_rows.columns:
             self.order_dates = order_rows['date'].tolist()
@@ -225,15 +287,42 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             
             for i, (ticker, date) in enumerate(zip(self.tickers, self.order_dates)):
                 ticker_dates = self.data_arrays[ticker]['dates']
-                order_date = pd.to_datetime(date).date()
-                date_mask = ticker_dates.date == order_date
+                
+                if isinstance(date, str):
+                    order_date = pd.to_datetime(date)
+                else:
+                    order_date = pd.to_datetime(date)
+                
+                if isinstance(ticker_dates, pd.DatetimeIndex):
+                    normalized_ticker_dates = ticker_dates.normalize()
+                else:
+                    # Convert to DatetimeIndex first if it's a regular Index
+                    ticker_dates = pd.to_datetime(ticker_dates)
+                    normalized_ticker_dates = ticker_dates.normalize()
+            
+                # normalize for date only comparison
+                normalized_order_date = pd.Timestamp(order_date).normalize()                
+            
+                # Find matching date
+                date_mask = normalized_ticker_dates == normalized_order_date
                 date_indices = np.where(date_mask)[0]
                 
                 if len(date_indices) == 0:
-                    raise ValueError(f"No data found for ticker {ticker} on date {order_date}")
+                    # Try finding the nearest date
+                    date_diffs = abs(normalized_ticker_dates - normalized_order_date)
+                    nearest_idx = date_diffs.argmin()
+                    
+                    # Check if nearest date is within acceptable range (e.g., 3 days)
+                    if date_diffs.iloc[nearest_idx].days <= 3:
+                        date_indices = np.array([nearest_idx])
+                        logger.warning(f"No exact match for {ticker} on {order_date.date()}, "
+                                     f"using nearest date: {ticker_dates[nearest_idx].date()}")
+                    else:
+                        raise ValueError(f"No data found for ticker {ticker} within 3 days of {order_date.date()}")
                 
                 self.global_start_indices[i] = date_indices[0] + self.start_time[i]
         else:
+            # If no date column in orders, just use start_time as indices
             self.global_start_indices = self.start_time.clone()
             self.order_dates = None
 
@@ -260,25 +349,32 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             start_indices = self.global_start_indices[env_indices_tensor]
             
             # Data validation
-            max_len = len(self.data_arrays[ticker]['High'])
+            max_len = len(self.data_arrays[ticker]['trade_high'])
             if (start_indices < 0).any() or (start_indices >= max_len).any():
-                for i in env_indices:
-                    if self.global_start_indices[i] < 0 or self.global_start_indices[i] >= max_len:
-                        raise ValueError(
-                            f"Order {self.order_idx[i]} (ticker={ticker}) has global_start_index {self.global_start_indices[i]} "
-                            f"which exceeds data length {max_len}."
+                for idx, env_idx in enumerate(env_indices):
+                    if self.global_start_indices[env_idx] < 0 or self.global_start_indices[env_idx] >= max_len:
+                        # Clamp to valid range
+                        self.global_start_indices[env_idx] = torch.clamp(
+                            self.global_start_indices[env_idx], 
+                            0, 
+                            max_len - 1
                         )
+                        logger.warning(f"Clamped index for order {self.order_idx[env_idx]} (ticker={ticker})")
+                
+                # Re-get indices after clamping
+                start_indices = self.global_start_indices[env_indices_tensor]
 
-            highs = self.data_arrays[ticker]['High'][start_indices]
-            lows = self.data_arrays[ticker]['Low'][start_indices]
+            highs = self.data_arrays[ticker]['trade_high'][start_indices]
+            lows = self.data_arrays[ticker]['trade_low'][start_indices]
             self.arrival_price[env_indices_tensor] = (highs + lows) / 2.0
 
         # Initialize first step values
-        market_data = self._get_market_data_batch(['Volume', 'VWAP', 'High', 'Low', 'DailyVolLag1'], use_prior_step=False)
-        current_volumes = market_data['Volume']
-        vwap_prices = market_data['VWAP']
+        market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low', 'daily_volatility_lag1'], use_prior_step=False)
+        current_volumes = market_data['trade_volume']
+        vwap_prices = market_data['vwap']
         
-        self.last_fill_price = vwap_prices.clone()
+        # Initialize last_fill_price to 0.0 since no trades have occurred yet
+        self.last_fill_price.zero_()
         self.last_trade_size.zero_()
         self.immediate_impact.zero_()
         self.accumulated_impact.zero_()
@@ -286,6 +382,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
 
         # Return initial observations
         obs = self._get_observation()
+
+        if not np.isfinite(obs).all():
+            idx = np.where(~np.isfinite(obs))[0]
+            raise RuntimeError(f"reset: Env returned non-finite features at idx={idx}, values={obs[idx]}")
+
         return obs
 
     def step_async(self, actions):
@@ -294,6 +395,26 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         @param actions: List of actions for each environment
         """
         self.actions = torch.tensor(actions, device=self.device, dtype=torch.int64)
+
+    def _calculate_deterministic_impact(self, trade_sizes):
+        """
+        Calculates the deterministic, immediate impact of a trade.
+
+        Args:
+            trade_sizes: Trade sizes for each environment
+
+        Returns:
+            Deterministic impact for each environment
+        """
+        # TODO: use a volume profile for this to scale for intraday seasonality
+        minute_volume = self.adv / 390.0
+        epsilon = trade_sizes.float() / minute_volume
+        deterministic_impact = self.env_impact_coef * epsilon
+        
+        return deterministic_impact
+
+
+
 
     def step_wait(self):
         """
@@ -305,11 +426,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             raise ValueError(f"Invalid actions {self.actions}. Must be between 0 and {len(self.action_values)-1}")
 
         # Get current market data
-        market_data = self._get_market_data_batch(['Volume', 'VWAP', 'High', 'Low', 'DailyVolLag1'], use_prior_step=False)
-        current_volumes = market_data['Volume']
-        vwap_prices = market_data['VWAP']
-        mid_prices = (market_data['High'] + market_data['Low']) * 0.5
-        daily_sigma = market_data['DailyVolLag1']
+        market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low', 'daily_volatility_lag1'], use_prior_step=False)
+        current_volumes = market_data['trade_volume']
+        vwap_prices = market_data['vwap']
+        mid_prices = (market_data['trade_high'] + market_data['trade_low']) * 0.5
+        daily_sigma = market_data['daily_volatility_lag1']
 
         # Compute trade sizes
         fractions = self.action_values[self.actions]
@@ -324,18 +445,23 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.total_market_volume += current_volumes + trade_sizes.float()
         self.total_market_volume = torch.clamp(self.total_market_volume, min=1)
 
-        # Compute impacts
-        self.immediate_impact = self.impact_coef * daily_sigma * torch.sqrt(trade_sizes.float() / self.adv)
-
-        # Residual impact decay
+        # Compute impacts using environment-specific parameters
+        deterministic_impact = self._calculate_deterministic_impact(trade_sizes)
+        self.immediate_impact = deterministic_impact
+        
+        # Residual impact decay using environment-specific parameters
         delta_t = torch.where(
             self.last_trade_step >= 0,
             (self.current_step - self.last_trade_step).float(),
             torch.ones_like(self.current_step, dtype=torch.float32)
         )
-        lambda_decay = torch.exp(-delta_t / self.decay_rate)
-        self.accumulated_impact = lambda_decay * self.accumulated_impact + self.immediate_impact
+        lambda_decay = torch.exp(-delta_t / self.env_decay_rate)
+        self.accumulated_impact = lambda_decay * self.accumulated_impact + deterministic_impact
         fill_prices = vwap_prices * (1 + self.side * self.accumulated_impact)
+
+        minutely_sigma = daily_sigma / np.sqrt(390.0)
+        stochastic_noise = torch.normal(mean=0.0, std=minutely_sigma)
+        total_log_return = deterministic_impact + stochastic_noise
 
         # Update order VWAP
         prior_filled_qty = self.order_qty - self.shares_remaining
@@ -364,7 +490,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
 
         # Advance time
         self.current_step += 1
-        self.last_fill_price = fill_prices
+        
+        # Only update last_fill_price when there's actually a trade
+        self.last_fill_price = torch.where(trade_executed_mask, fill_prices, self.last_fill_price)
         self.last_trade_size = trade_sizes
         self.last_action_fraction = fractions
 
@@ -399,6 +527,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
 
         # Get new observations
         obs = self._get_observation()
+
+        if not np.isfinite(obs).all():
+            idx = np.where(~np.isfinite(obs))[0]
+            raise RuntimeError(f"step_asynch:Env returned non-finite features at idx={idx}, values={obs[idx]}")
+
         
         # Convert to numpy for VecEnv interface
         # Note: This is not strictly necessary, but keeps interface consistent
@@ -414,7 +547,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
     def _get_market_data_batch(self, fields: List[str], use_prior_step: bool = False) -> Dict[str, torch.Tensor]:
         """
         Gather market data for current step for specified fields.
-        @param fields: List of fields to gather (e.g., ['High', 'Low', 'Volume'])
+        @param fields: List of fields to gather (e.g., ['trade_high', 'trade_low', 'trade_volume'])
         @param use_prior_step: Whether to use data from the prior step (default False)
         @return: Dictionary of tensors for each requested field
         """
@@ -454,14 +587,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         Return batch of observations.
         @return: Numpy array of observations for all environments
         """
-        market_data = self._get_market_data_batch(['High', 'Low', 'Volume', 'Signal', 'Regime', 'DailyVolLag1', 'DailyVol5d'], use_prior_step=True)
+        market_data = self._get_market_data_batch(['trade_high', 'trade_low', 'trade_volume', 'Signal', 'Regime', 'daily_volatility_lag1', 'daily_volatility_5d'], use_prior_step=True)
         
-        mid_price = (market_data['High'] + market_data['Low']) * 0.5
-        volume = market_data['Volume']
+        mid_price = (market_data['trade_high'] + market_data['trade_low']) * 0.5
+        volume = market_data['trade_volume']
         signal = market_data['Signal']
         regime = market_data['Regime']
-        vol_lag1 = market_data['DailyVolLag1']
-        vol5d = market_data['DailyVol5d']
+        vol_lag1 = market_data['daily_volatility_lag1']
+        vol5d = market_data['daily_volatility_5d']
 
         obs_tensor = torch.stack([
             mid_price,
@@ -566,10 +699,10 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 obs, rewards, dones, infos = self.step_wait()
                 
                 # Get current market data for the first environment
-                market_data = self._get_market_data_batch(['Volume', 'VWAP', 'High', 'Low'], use_prior_step=False)
-                current_volume = market_data['Volume'][env_idx].item()
-                vwap_price = market_data['VWAP'][env_idx].item()
-                mid_price = ((market_data['High'][env_idx] + market_data['Low'][env_idx]) * 0.5).item()
+                market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low'], use_prior_step=False)
+                current_trade_volume = market_data['trade_volume'][env_idx].item()
+                vwap_price = market_data['vwap'][env_idx].item()
+                mid_price = ((market_data['trade_high'][env_idx] + market_data['trade_low'][env_idx]) * 0.5).item()
                 
                 # Track info for first environment (for compatibility)
                 info = {
@@ -598,7 +731,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                     # Add missing fields required by plotting functions
                     'mid_price': mid_price,
                     'vwap_price': vwap_price,
-                    'current_volume': current_volume
+                    'current_trade_volume': current_trade_volume
                 }
                 
                 if self.order_dates:
@@ -632,8 +765,6 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Validate that we got valid data
         if order_rows.empty:
             raise ValueError(f"No order data found for indices {order_indices}")
-            
-
 
         # Extract order details for the batch with validation
         self.tickers = order_rows['ticker'].tolist()
@@ -664,6 +795,43 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.side = torch.tensor([1 if s.lower() == 'buy' else -1 for s in order_rows['side']], 
                                 device=self.device, dtype=torch.int8)
 
+        # Set environment-specific impact parameters from orders_df or use defaults
+        if 'Y' in order_rows.columns:
+            Y_values = order_rows['Y'].values
+            # Check for NaN values and replace with median
+            nan_mask = pd.isna(Y_values)
+            if nan_mask.any():
+                valid_values = Y_values[~nan_mask]
+                if len(valid_values) > 0:
+                    median_value = np.median(valid_values)
+                    logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
+                    Y_values = np.where(nan_mask, median_value, Y_values)
+                else:
+                    logger.warning(f"All Y values are NaN, using default {self.impact_coef.item()}")
+                    Y_values = np.full_like(Y_values, self.impact_coef.item())
+            self.env_impact_coef = torch.tensor(Y_values, device=self.device, dtype=torch.float32)
+        else:
+            # Use default impact coefficient for all environments
+            self.env_impact_coef = self.impact_coef.expand(self.num_envs)
+            
+        if 'tau' in order_rows.columns:
+            tau_values = order_rows['tau'].values
+            # Check for NaN values and replace with median
+            nan_mask = pd.isna(tau_values)
+            if nan_mask.any():
+                valid_values = tau_values[~nan_mask]
+                if len(valid_values) > 0:
+                    median_value = np.median(valid_values)
+                    logger.warning(f"Found {nan_mask.sum()} NaN tau values, replacing with median {median_value}")
+                    tau_values = np.where(nan_mask, median_value, tau_values)
+                else:
+                    logger.warning(f"All tau values are NaN, using default {self.decay_rate.item()}")
+                    tau_values = np.full_like(tau_values, self.decay_rate.item())
+            self.env_decay_rate = torch.tensor(tau_values, device=self.device, dtype=torch.float32)
+        else:
+            # Use default decay rate for all environments
+            self.env_decay_rate = self.decay_rate.expand(self.num_envs)
+
         # Handle dates for global indexing
         if 'date' in order_rows.columns:
             self.order_dates = order_rows['date'].tolist()
@@ -671,17 +839,37 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             
             for i, (ticker, date) in enumerate(zip(self.tickers, self.order_dates)):
                 ticker_dates = self.data_arrays[ticker]['dates']
-                order_date = pd.to_datetime(date).date()
-                date_mask = ticker_dates.date == order_date
+                
+                if isinstance(date, str):
+                    order_date = pd.to_datetime(date)
+                else:
+                    order_date = pd.to_datetime(date)
+                
+                # Normalize times for date-only comparison
+                normalized_ticker_dates = ticker_dates.normalize()
+                normalized_order_date = pd.Timestamp(order_date).normalize()
+                
+                # Find matching date
+                date_mask = normalized_ticker_dates == normalized_order_date
                 date_indices = np.where(date_mask)[0]
                 
-                if len(date_indices) > 0:
-                    self.global_start_indices[i] = torch.tensor(date_indices[0], device=self.device)
-                else:
-                    raise ValueError(f"No data found for ticker {ticker} on date {order_date}")
+                if len(date_indices) == 0:
+                    # Try finding the nearest date
+                    date_diffs = abs(normalized_ticker_dates - normalized_order_date)
+                    nearest_idx = date_diffs.argmin()
+                    
+                    # Check if nearest date is within acceptable range
+                    if date_diffs.iloc[nearest_idx].days <= 3:
+                        date_indices = np.array([nearest_idx])
+                        logger.warning(f"No exact match for {ticker} on {order_date.date()}, "
+                                     f"using nearest date: {ticker_dates[nearest_idx].date()}")
+                    else:
+                        raise ValueError(f"No data found for ticker {ticker} within 3 days of {order_date.date()}")
+                
+                self.global_start_indices[i] = date_indices[0] + self.start_time[i]
         else:
             self.order_dates = None
-            self.global_start_indices = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
+            self.global_start_indices = self.start_time.clone()
 
         # Reset state variables (but keep order data we just set)
         self.current_step = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
@@ -699,7 +887,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.total_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.total_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         
-        # Compute arrival prices (this was missing!)
+        # Compute arrival prices
         self.arrival_price.zero_()
         for ticker in set(self.tickers):
             if ticker is None or ticker not in self.data_arrays:
@@ -713,11 +901,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             start_indices = self.global_start_indices[env_indices_tensor]
             
             # Data validation
-            max_len = len(self.data_arrays[ticker]['High'])
+            max_len = len(self.data_arrays[ticker]['trade_high'])
             valid_indices = torch.clamp(start_indices, 0, max_len - 1)
             
-            highs = self.data_arrays[ticker]['High'][valid_indices]
-            lows = self.data_arrays[ticker]['Low'][valid_indices]
+            highs = self.data_arrays[ticker]['trade_high'][valid_indices]
+            lows = self.data_arrays[ticker]['trade_low'][valid_indices]
             self.arrival_price[env_indices_tensor] = (highs + lows) / 2.0
         
         # Return initial observation
@@ -779,4 +967,4 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         @param indices: Optional indices to set attribute in specific environments
         """
         if hasattr(self, attr_name):
-            setattr(self, attr_name, value) 
+            setattr(self, attr_name, value)

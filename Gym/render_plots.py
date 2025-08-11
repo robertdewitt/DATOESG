@@ -2,6 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import logging
+from matplotlib.ticker import MaxNLocator
+
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -235,22 +237,32 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     axes[plot_idx].legend()
     plot_idx += 1
 
-    # Side distribution (buy/sell)
-    train_sides = a_df['side'].value_counts()
-    axes[plot_idx].bar(train_sides.index, train_sides.values, alpha=0.5, label=a_name)
-    if b_df is not None:
-        test_sides = b_df['side'].value_counts()
-        axes[plot_idx].bar(test_sides.index, test_sides.values, alpha=0.5, label=b_name)
-    axes[plot_idx].set_title('Order Side Distribution')
-    axes[plot_idx].set_xlabel('Side')
-    axes[plot_idx].set_ylabel('Count')
-    axes[plot_idx].legend()
+    # Y values distribution (impact coefficient)
+    if 'Y' in a_df.columns:
+        y_data_a = a_df['Y'].dropna()
+        y_data_b = b_df['Y'].dropna() if b_df is not None and 'Y' in b_df.columns else pd.Series()
+        
+        if len(y_data_a) > 0 or len(y_data_b) > 0:
+            if len(y_data_a) > 0:
+                axes[plot_idx].hist(y_data_a, bins=50, alpha=0.5, label=a_name)
+            if len(y_data_b) > 0:
+                axes[plot_idx].hist(y_data_b, bins=50, alpha=0.5, label=b_name)
+            axes[plot_idx].set_title('Y Values Distribution (Impact Coefficient)')
+            axes[plot_idx].set_xlabel('Y Value')
+            axes[plot_idx].set_ylabel('Frequency')
+            axes[plot_idx].legend()
+        else:
+            axes[plot_idx].text(0.5, 0.5, 'No valid Y values to plot', ha='center', va='center', transform=axes[plot_idx].transAxes)
+            axes[plot_idx].set_title('Y Values Distribution (No Data)')
+    else:
+        axes[plot_idx].text(0.5, 0.5, 'Y column not found in data', ha='center', va='center', transform=axes[plot_idx].transAxes)
+        axes[plot_idx].set_title('Y Values Distribution (Column Not Found)')
     plot_idx += 1
 
     # Volatility distribution
-    axes[plot_idx].hist(a_df['today_volatility'], bins=50, alpha=0.5, label=a_name)
+    axes[plot_idx].hist(a_df['daily_volatility'], bins=50, alpha=0.5, label=a_name)
     if b_df is not None:
-        axes[plot_idx].hist(b_df['today_volatility'], bins=50, alpha=0.5, label=b_name)
+        axes[plot_idx].hist(b_df['daily_volatility'], bins=50, alpha=0.5, label=b_name)
     axes[plot_idx].set_title('Daily Volatility Distribution')
     axes[plot_idx].set_xlabel('Daily Volatility')
     axes[plot_idx].set_ylabel('Frequency')
@@ -270,11 +282,11 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     # Daily Volatility Box Plot
     # Prepare data for box plots
     a_df['date'] = pd.to_datetime(a_df['date'])
-    train_daily_vol = a_df.groupby(a_df['date'].dt.date)['today_volatility'].apply(list).to_dict()
+    train_daily_vol = a_df.groupby(a_df['date'].dt.date)['daily_volatility'].apply(list).to_dict()
     
     if b_df is not None:
         b_df['date'] = pd.to_datetime(b_df['date'])
-        test_daily_vol = b_df.groupby(b_df['date'].dt.date)['today_volatility'].apply(list).to_dict()
+        test_daily_vol = b_df.groupby(b_df['date'].dt.date)['daily_volatility'].apply(list).to_dict()
     
     # Combine all dates and sort them
     all_dates = sorted(set(train_daily_vol.keys()) | (set(test_daily_vol.keys()) if b_df is not None else set()))
@@ -319,87 +331,111 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     axes[plot_idx].legend(handles=legend_elements)
     plot_idx += 1
 
-    # Intra-order Return Box Plot
-    # Prepare data for box plots
-    train_daily_returns = a_df.groupby(a_df['date'].dt.date)['intra_order_return'].apply(list).to_dict()
-    
-    if b_df is not None:
-        test_daily_returns = b_df.groupby(b_df['date'].dt.date)['intra_order_return'].apply(list).to_dict()
-    
-    # Prepare data for box plot
-    returns_data = []
-    colors = []
-    positions = []
-    
-    for i, date in enumerate(all_dates):
-        if date in train_daily_returns:
-            returns_data.append(train_daily_returns[date])
-            colors.append('blue')
-            positions.append(i)
-        if b_df is not None and date in test_daily_returns:
-            returns_data.append(test_daily_returns[date])
-            colors.append('orange')
-            positions.append(i + 0.3)  # Offset test data slightly
-    
-    # Create box plot
-    bp2 = axes[plot_idx].boxplot(returns_data, positions=positions, widths=0.25, patch_artist=True)
-    
-    # Color the boxes
-    for patch, color in zip(bp2['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.5)
-    
-    axes[plot_idx].set_title('Intra-order Returns by Date')
-    axes[plot_idx].set_xlabel('Date')
-    axes[plot_idx].set_ylabel('Intra-order Return')
-    axes[plot_idx].set_xticks(range(len(all_dates)))
-    axes[plot_idx].set_xticklabels([str(d) for d in all_dates], rotation=45, ha='right')
-    
-    # Add legend
-    axes[plot_idx].legend(handles=legend_elements)
+    # Tau values distribution (decay rate)
+    if 'tau' in a_df.columns:
+        tau_data_a = a_df['tau'].dropna()
+        tau_data_b = b_df['tau'].dropna() if b_df is not None and 'tau' in b_df.columns else pd.Series()
+        
+        if len(tau_data_a) > 0 or len(tau_data_b) > 0:
+            if len(tau_data_a) > 0:
+                axes[plot_idx].hist(tau_data_a, bins=50, alpha=0.5, label=a_name)
+            if len(tau_data_b) > 0:
+                axes[plot_idx].hist(tau_data_b, bins=50, alpha=0.5, label=b_name)
+            axes[plot_idx].set_title('Tau Values Distribution (Decay Rate)')
+            axes[plot_idx].set_xlabel('Tau Value')
+            axes[plot_idx].set_ylabel('Frequency')
+            axes[plot_idx].legend()
+        else:
+            axes[plot_idx].text(0.5, 0.5, 'No valid tau values to plot', ha='center', va='center', transform=axes[plot_idx].transAxes)
+            axes[plot_idx].set_title('Tau Values Distribution (No Data)')
+    else:
+        axes[plot_idx].text(0.5, 0.5, 'Tau column not found in data', ha='center', va='center', transform=axes[plot_idx].transAxes)
+        axes[plot_idx].set_title('Tau Values Distribution (Column Not Found)')
     plot_idx += 1
 
-    # ADV Percentage Box Plot
-    # Prepare data for box plots
-    train_daily_adv_pct = a_df.groupby(a_df['date'].dt.date)['adv_pct'].apply(list).to_dict()
+    # ADV Percentage Line Plot with Standard Error Bands
+    # Prepare data for line plots
+    train_daily_adv_pct = a_df.groupby(a_df['date'].dt.date)['adv_pct'].agg(['mean', 'std', 'count']).to_dict('index')
     
     if b_df is not None:
-        test_daily_adv_pct = b_df.groupby(b_df['date'].dt.date)['adv_pct'].apply(list).to_dict()
+        test_daily_adv_pct = b_df.groupby(b_df['date'].dt.date)['adv_pct'].agg(['mean', 'std', 'count']).to_dict('index')
     
-    # Prepare data for box plot
-    adv_pct_data = []
-    colors = []
-    positions = []
+    # Prepare data for line plot
+    train_dates = []
+    train_means = []
+    train_errors = []
     
-    for i, date in enumerate(all_dates):
+    test_dates = []
+    test_means = []
+    test_errors = []
+    
+    for date in sorted(all_dates):
         if date in train_daily_adv_pct:
-            # Convert to percentage for display
-            adv_pct_data.append([x * 100 for x in train_daily_adv_pct[date]])
-            colors.append('blue')
-            positions.append(i)
+            train_dates.append(date)
+            mean_val = train_daily_adv_pct[date]['mean'] * 100  # Convert to percentage
+            std_val = train_daily_adv_pct[date]['std'] * 100 if train_daily_adv_pct[date]['std'] is not None else 0
+            count_val = train_daily_adv_pct[date]['count']
+            std_error = std_val / np.sqrt(count_val) if count_val > 0 else 0
+            
+            train_means.append(mean_val)
+            train_errors.append(std_error)
+        
         if b_df is not None and date in test_daily_adv_pct:
-            # Convert to percentage for display
-            adv_pct_data.append([x * 100 for x in test_daily_adv_pct[date]])
-            colors.append('orange')
-            positions.append(i + 0.3)  # Offset test data slightly
+            test_dates.append(date)
+            mean_val = test_daily_adv_pct[date]['mean'] * 100  # Convert to percentage
+            std_val = test_daily_adv_pct[date]['std'] * 100 if test_daily_adv_pct[date]['std'] is not None else 0
+            count_val = test_daily_adv_pct[date]['count']
+            std_error = std_val / np.sqrt(count_val) if count_val > 0 else 0
+            
+            test_means.append(mean_val)
+            test_errors.append(std_error)
     
-    # Create box plot
-    bp3 = axes[plot_idx].boxplot(adv_pct_data, positions=positions, widths=0.25, patch_artist=True)
+    # Create line plot with error bands
+    if train_dates:
+        x_train = range(len(train_dates))
+        axes[plot_idx].plot(x_train, train_means, 'o-', color='blue', label=a_name, linewidth=2, markersize=4)
+        axes[plot_idx].fill_between(x_train, 
+                                   [m - e for m, e in zip(train_means, train_errors)], 
+                                   [m + e for m, e in zip(train_means, train_errors)], 
+                                   color='blue', alpha=0.2)
     
-    # Color the boxes
-    for patch, color in zip(bp3['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.5)
+    if b_df is not None and test_dates:
+        x_test = range(len(test_dates))
+        axes[plot_idx].plot(x_test, test_means, 's-', color='orange', label=b_name, linewidth=2, markersize=4)
+        axes[plot_idx].fill_between(x_test, 
+                                   [m - e for m, e in zip(test_means, test_errors)], 
+                                   [m + e for m, e in zip(test_means, test_errors)], 
+                                   color='orange', alpha=0.2)
     
-    axes[plot_idx].set_title('ADV Percentage by Date')
+    axes[plot_idx].set_title('ADV Percentage by Date (Mean ± Standard Error)')
     axes[plot_idx].set_xlabel('Date')
     axes[plot_idx].set_ylabel('ADV Percentage (%)')
-    axes[plot_idx].set_xticks(range(len(all_dates)))
-    axes[plot_idx].set_xticklabels([str(d) for d in all_dates], rotation=45, ha='right')
+    axes[plot_idx].grid(True, alpha=0.3)
+    
+    # Set x-ticks and labels
+    if train_dates or (b_df is not None and test_dates):
+        # Use the longer date list for x-axis
+        main_dates = train_dates if len(train_dates) >= len(test_dates if test_dates else []) else test_dates
+        axes[plot_idx].set_xticks(range(len(main_dates)))
+        axes[plot_idx].set_xticklabels([str(d) for d in main_dates], rotation=45, ha='right')
     
     # Add legend
-    axes[plot_idx].legend(handles=legend_elements)
+    axes[plot_idx].legend()
     plot_idx += 1
+
+    date_axes_indices = [
+        # these are the subplot indices where you're doing the date boxplots:
+        # 6: Daily Volatility by Date
+        # 7: Intra-order Returns by Date
+        # 8: ADV Percentage by Date
+        6, 7, 8
+    ]
+
+    for idx in date_axes_indices:
+        ax = axes[idx]
+        # ensure no more than 12 major ticks
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=12, integer=True))
+ 
 
     plt.tight_layout()
     plt.show()
@@ -425,6 +461,7 @@ def create_execution_summary_table(orders_dict, trim=0):
         durations = []
         returns = []
         incomplete_orders = 0
+        orders_with_no_arrival_price = 0
         total_orders = len(orders)
         
         # For trimming, we need to collect slippages with their notional weights
@@ -454,13 +491,17 @@ def create_execution_summary_table(orders_dict, trim=0):
                 # side adjustment for slippage direction
                 if first_step['side'] == 'sell':
                     slippage = -slippage
+                            # Calculate intra-order return
+                intra_return = (last_step['mid_price'] - arrival_price) / arrival_price
+                weighted_return += intra_return * notional
+            
             else:
                 # Undefined arrival price – set slippage to 0 and warn once
                 slippage = 0.0
-                if 'SLIPPAGE_WARNED' not in globals():
-                    print("⚠️  Warning: arrival_price was 0 for at least one order; slippage set to 0 to avoid division-by-zero.")
-                    globals()['SLIPPAGE_WARNED'] = True
-                
+                intra_return = 0.0
+                orders_with_no_arrival_price += 1
+
+            returns.append(intra_return)
             slippages.append(slippage)
             slippage_notional_pairs.append((slippage, notional))
             
@@ -476,10 +517,6 @@ def create_execution_summary_table(orders_dict, trim=0):
             weighted_duration += duration_ratio * notional
             durations.append(duration_ratio)
             
-            # Calculate intra-order return
-            intra_return = (last_step['mid_price'] - first_step['arrival_price']) / first_step['arrival_price']
-            weighted_return += intra_return * notional
-            returns.append(intra_return)
             
             # Collect action percentages
             for step in order_info:
@@ -536,6 +573,9 @@ def create_execution_summary_table(orders_dict, trim=0):
         # Calculate percentage of incomplete orders
         incomplete_pct = (incomplete_orders / total_orders * 100) if total_orders > 0 else 0
         
+        # orders with no arrival perventage 
+        orders_with_no_arrival_pct = (orders_with_no_arrival_price / total_orders * 100) if total_orders > 0 else 0
+
         return {
             'Weighted Slippage (bps)': weighted_slippage * 10000,  # Convert to basis points
             'Slippage Std Dev (bps)': slippage_std,
@@ -547,7 +587,8 @@ def create_execution_summary_table(orders_dict, trim=0):
             'Reward Std Dev (bps)': reward_std,
             'Mean Action %': mean_action,
             'Action % Std Dev': action_std,
-            'Incomplete Orders %': incomplete_pct
+            'Incomplete Orders %': incomplete_pct,
+            'Orders with no arrival price %': orders_with_no_arrival_pct
         }
     
     # Calculate metrics for all models
@@ -582,7 +623,8 @@ def create_execution_summary_table(orders_dict, trim=0):
         ('Weighted Intra-Order Return (bps)', 'Return Std Dev (bps)'),
         ('Mean Reward (bps)', 'Reward Std Dev (bps)'),
         ('Mean Action %', 'Action % Std Dev'),
-        ('Incomplete Orders %', None)  # No std dev for percentage
+        ('Incomplete Orders %', None),
+        ('Orders with no arrival price %', None)  # No std dev for percentage
     ]
     
     # Display each metric pair

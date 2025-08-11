@@ -13,7 +13,7 @@ class CustomTensorBoardCallback(BaseCallback):
     Custom callback to log additional training statistics to TensorBoard.
     """
     
-    def __init__(self, verbose: int = 0):
+    def __init__(self, verbose: int = 0, log_parameters: bool = True):
         super().__init__(verbose)
         self.episode_rewards = []
         self.episode_lengths = []
@@ -21,6 +21,7 @@ class CustomTensorBoardCallback(BaseCallback):
         self.value_predictions = []
         self.policy_losses = []
         self.value_losses = []
+        self.log_parameters = log_parameters
         
     def _on_step(self) -> bool:
         """
@@ -100,24 +101,42 @@ class CustomTensorBoardCallback(BaseCallback):
                     self.logger.record("custom/rollout_value_mean", np.mean(values))
                     self.logger.record("custom/rollout_value_std", np.std(values))
         
-        # Log model parameters statistics
-        if hasattr(self.model, 'policy'):
+        # Log model parameters statistics (simplified to avoid key conflicts)
+        if hasattr(self.model, 'policy') and self.log_parameters:
             policy = self.model.policy
             
-            # Log policy network weights statistics
+            # Log only key policy parameters to avoid logger key conflicts
+            total_policy_norm = 0
+            total_value_norm = 0
+            param_count = 0
+            
             for name, param in policy.named_parameters():
                 if param.requires_grad:
                     param_np = param.detach().cpu().numpy()
-                    self.logger.record(f"custom/policy_{name}_mean", np.mean(param_np))
-                    self.logger.record(f"custom/policy_{name}_std", np.std(param_np))
-                    self.logger.record(f"custom/policy_{name}_norm", np.linalg.norm(param_np))
+                    param_norm = np.linalg.norm(param_np)
+                    
+                    # Only log statistics for key layers to avoid conflicts
+                    if 'policy_net' in name and '.0.' in name:  # First layer of policy net
+                        self.logger.record("custom/policy_first_layer_mean", np.mean(param_np))
+                        self.logger.record("custom/policy_first_layer_std", np.std(param_np))
+                        self.logger.record("custom/policy_first_layer_norm", param_norm)
+                    elif 'value_net' in name and '.0.' in name:  # First layer of value net
+                        self.logger.record("custom/value_first_layer_mean", np.mean(param_np))
+                        self.logger.record("custom/value_first_layer_std", np.std(param_np))
+                        self.logger.record("custom/value_first_layer_norm", param_norm)
+                    
+                    # Accumulate norms for overall statistics
+                    if 'policy_net' in name:
+                        total_policy_norm += param_norm
+                    elif 'value_net' in name:
+                        total_value_norm += param_norm
+                    param_count += 1
             
-            # Log value function statistics
-            if hasattr(policy, 'value_net'):
-                value_params = list(policy.value_net.parameters())
-                if value_params:
-                    value_norm = sum(p.norm().item() for p in value_params)
-                    self.logger.record("custom/value_net_norm", value_norm)
+            # Log overall network statistics
+            if param_count > 0:
+                self.logger.record("custom/total_policy_norm", total_policy_norm)
+                self.logger.record("custom/total_value_norm", total_value_norm)
+                self.logger.record("custom/avg_param_norm", (total_policy_norm + total_value_norm) / param_count)
         
         # Log gradient statistics
         if hasattr(self.model, 'policy'):
@@ -242,4 +261,30 @@ class TrainingDebugCallback(BaseCallback):
                             self.logger.record(f"debug/obs_{name}_mean", np.mean(obs[..., i]))
                             self.logger.record(f"debug/obs_{name}_std", np.std(obs[..., i]))
         
-        return True 
+        return True
+
+
+def create_training_callbacks(enable_custom=True, enable_env_stats=True, enable_debug=False, 
+                             verbose=0, log_parameters=True):
+    """
+    Helper function to create a list of callbacks for training.
+    
+    @param enable_custom: Whether to enable CustomTensorBoardCallback
+    @param enable_env_stats: Whether to enable EnvironmentStatsCallback
+    @param enable_debug: Whether to enable TrainingDebugCallback
+    @param verbose: Verbosity level for callbacks
+    @param log_parameters: Whether to log model parameter statistics (can cause logger conflicts if disabled)
+    @return: List of callbacks ready to use with model.learn()
+    """
+    callbacks = []
+    
+    if enable_custom:
+        callbacks.append(CustomTensorBoardCallback(verbose=verbose, log_parameters=log_parameters))
+    
+    if enable_env_stats:
+        callbacks.append(EnvironmentStatsCallback(verbose=verbose))
+    
+    if enable_debug:
+        callbacks.append(TrainingDebugCallback(verbose=verbose))
+    
+    return callbacks 

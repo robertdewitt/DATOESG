@@ -4,6 +4,11 @@ import numpy as np
 import random
 import mkt_data_yfinance as mdy
 import logging
+from typing import Optional, List, Dict
+import time
+from quote_and_trade_analytics import QuoteAndTradeAnalytics
+from datetime import date
+from propagator_param_loader import PropagatorParamLoader
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -12,7 +17,10 @@ logger = logging.getLogger(__name__)
 class OrderGenerator:
     def __init__(self, stock_df_list, market_data, num_orders=10,  min_adv_pct=0.0001,
                  max_adv_pct=0.25, min_time_horizon=2, max_time_horizon=390, sd_delta=0, 
-                 ed_delta=0, debug=False, seed=None):
+                 ed_delta=0, md_source='yfinance', debug=False, seed=None, dates=None,
+                 analytics: Optional['QuoteAndTradeAnalytics'] = None,
+                 propagator_loader: Optional['PropagatorParamLoader'] = None,
+                 y_column: str = 'Y', tau_column: str = 'tau'):
         """
         Initialize the OrderGenerator with a random DataFrame of orders.
         @param stock_df_list: List of DataFrames containing stock data.
@@ -24,8 +32,13 @@ class OrderGenerator:
         @param max_time_horizon: Maximum time horizon for orders in minutes.
         @param sd_delta: Start date delta - number of days to shift the start date of the order generation.
         @param ed_delta: End date delta - number of days to shift the end date of the order generation.
+        @param md_source: Source of market data - 'yfinance' or 'mana'.
         @param debug: Enable debug logging.
         @param seed: Random seed for reproducibility.
+        @param analytics: QuoteAndTradeAnalytics instance with pre-loaded analytics data.
+        @param propagator_loader: PropagatorParamLoader instance for Y and tau parameters (optional).
+        @param y_column: Column name for Y parameter in propagator data (default: 'Y').
+        @param tau_column: Column name for tau parameter in propagator data (default: 'tau').
         @return: None
         """
         # Set logging level based on debug parameter
@@ -48,190 +61,469 @@ class OrderGenerator:
         self.mdl = market_data
         self.sd_delta = sd_delta
         self.ed_delta = ed_delta
-        self.orders_df = self._generate_orders()
+        self.md_source = md_source
+        self.analytics = analytics  # Store analytics instance
+        self.propagator_loader = propagator_loader  # Store propagator loader instance
+        self.y_column = y_column
+        self.tau_column = tau_column
+        self.dates = dates
 
-    def _generate_orders(self):
+        if self.dates is None:
+            logger.warning("No dates provided, cannot generate orders")
+            return
+
+        self.orders_df = self._generate_orders_fast()
+
+
+    def _generate_orders_fast(self):
         """
         Generate a dataframe of random orders based on the stock data.
-        @return: DataFrame containing the generated orders.
+        Optimized version using vectorized operations throughout.
         """
-        # extract unique stock names from the list of stock data frames 
-        stocks = self.mdl.sample_tickers_from_data(self.stock_df_list, self.num_orders)
-        logger.debug(f"Generating {self.num_orders} orders for stocks: {stocks}")
+        import time
+        start_time = time.time()
         
-        # calculate average daily volume (ADV) for each stock
-        advs = self._calculate_advs()
-        logger.debug(f"Calculated ADV for stocks: {advs}")
-
-        # Get date range from the data
-        # Use the first stock to determine the date range (assuming all stocks have same date range)
-        sample_ticker = list(self.stock_df_list.keys())[0]
-        sample_df = self.stock_df_list[sample_ticker]
+        # Set up random number generator
+        rng = np.random.RandomState(self.seed)
         
-        # Get unique dates from the data
-        unique_dates = pd.to_datetime(sample_df.index.date).unique()
-        unique_dates = sorted(unique_dates)
+        # Extract unique stock names and dates
+        available_stocks = list(self.stock_df_list.keys())
+        unique_dates = self.dates
         
-        # Apply sd_delta and ed_delta to filter dates
-        if self.sd_delta > 0:
-            unique_dates = unique_dates[self.sd_delta:]
-        if self.ed_delta > 0:
-            unique_dates = unique_dates[:-self.ed_delta]
-            
         if len(unique_dates) == 0:
-            raise ValueError(f"No dates available after applying sd_delta={self.sd_delta} and ed_delta={self.ed_delta}")
-            
-        logger.debug(f"Available dates after filtering: {len(unique_dates)} days from {unique_dates[0]} to {unique_dates[-1]}")
+            raise ValueError(f"No dates available")
         
-        # Calculate orders per day for even distribution
-        orders_per_day = self.num_orders // len(unique_dates)
-        remaining_orders = self.num_orders % len(unique_dates)
+        logger.info(f"Generating {self.num_orders} orders for {len(available_stocks)} stocks across {len(unique_dates)} dates")
+        logger.info(f"Date range: {unique_dates[0]} to {unique_dates[-1]}")
         
-        logger.debug(f"Distributing {self.num_orders} orders across {len(unique_dates)} days: {orders_per_day} per day with {remaining_orders} extra")
+        # Step 1: Build availability matrix and ADV matrix
+        logger.info("Building availability matrix and computing ADV...")
+        matrix_start = time.time()
         
-        # Initialize lists to store order data
-        order_dates = []
-        order_start_times = []
-        order_end_times = []
-        order_time_horizons = []
-        order_stocks = []  # Track which stocks were actually used
+        availability_matrix = self._build_availability_matrix(available_stocks, unique_dates)
+        adv_matrix = self.analytics.get_adv_matrix(available_stocks, unique_dates)
         
-        order_idx = 0
-        for date_idx, order_date in enumerate(unique_dates):
-            # Calculate number of orders for this date
-            num_orders_this_date = orders_per_day
-            # Distribute remaining orders across first few days
-            if date_idx < remaining_orders:
-                num_orders_this_date += 1
-                
-            logger.debug(f"Generating {num_orders_this_date} orders for date {order_date}")
-            
-            for _ in range(num_orders_this_date):
-                if order_idx >= self.num_orders:
-                    break
-                    
-                # Get the ticker for this order
-                ticker = stocks[order_idx]
-                df = self.stock_df_list[ticker]
-                
-                # Filter data for the selected date
-                date_data = df[df.index.date == pd.to_datetime(order_date).date()]
-                available_minutes = len(date_data)
-                
-                if available_minutes == 0:
-                    logger.warning(f"No data available for ticker {ticker} on date {order_date}, skipping")
-                    order_idx += 1  # Still increment to try next ticker
-                    continue
-                
-                # Generate time horizon
-                time_horizon = np.random.randint(self.min_time_horizon, 
-                                               min(self.max_time_horizon, available_minutes) + 1)
-                
-                # Generate start time ensuring order can complete within the day
-                max_start = max(0, available_minutes - time_horizon)
-                start_time = np.random.randint(0, max_start + 1) if max_start > 0 else 0
-                end_time = start_time + time_horizon
-                
-                order_dates.append(order_date)
-                order_time_horizons.append(time_horizon)
-                order_start_times.append(start_time)
-                order_end_times.append(end_time)
-                order_stocks.append(ticker)
-                
-                order_idx += 1
+        logger.info(f"Matrix built in {time.time() - matrix_start:.2f}s")
+        
+        # Step 2: Generate valid orders
+        logger.info("Generating valid orders...")
+        gen_start = time.time()
+        
+        valid_orders_data = self._sample_valid_orders(
+            availability_matrix, adv_matrix, available_stocks, unique_dates, 
+            self.num_orders, rng
+        )
+        
+        logger.info(f"Orders sampled in {time.time() - gen_start:.2f}s")
+        
+        # Step 3: Generate order parameters
+        logger.info("Generating order parameters...")
+        param_start = time.time()
+        
+        order_params = self._generate_order_parameters(
+            valid_orders_data['minutes'],
+            valid_orders_data['advs'],
+            len(valid_orders_data['stocks']),
+            rng
+        )
+        
+        logger.info(f"Parameters generated in {time.time() - param_start:.2f}s")
+        
+        # Step 4: Create DataFrame
+        orders_df = self._create_orders_dataframe(valid_orders_data, order_params)
+        
+        # Step 5: Load analytics
+        logger.info("Loading analytics...")
+        analytics_start = time.time()
+        
+        orders_df = self._load_analytics_data(orders_df)
+        
+        logger.info(f"Analytics loaded in {time.time() - analytics_start:.2f}s")
+        
+        # Step 6: Load propagator parameters
+        logger.info("Loading propagator parameters...")
+        prop_start = time.time()
+        
+        orders_df = self._load_propagator_params(orders_df)
+        
+        logger.info(f"Propagator parameters loaded in {time.time() - prop_start:.2f}s")
+        
+        # Step 7: Calculate intra-order returns
+        logger.info("Calculating intra-order returns...")
+        returns_start = time.time()
+        
+        orders_df = self._calculate_intra_order_returns(orders_df)
+        
+        logger.info(f"Returns calculated in {time.time() - returns_start:.2f}s")
+        
+        total_time = time.time() - start_time
+        logger.info(f"Generated {len(orders_df)} orders in {total_time:.2f}s total")
+        logger.debug(f"Orders per date distribution:\n{orders_df['date'].value_counts().sort_index()}")
+        
+        return orders_df
 
-        # Get the actual number of orders generated
-        actual_num_orders = len(order_dates)
-        logger.debug(f"Actually generated {actual_num_orders} orders out of {self.num_orders} requested")
-        
-        # Convert to numpy arrays
-        time_horizons = np.array(order_time_horizons)
-        start_times = np.array(order_start_times)
-        end_times = np.array(order_end_times)
 
-        # scale to rational size for horizon given
-        pct_of_day = time_horizons / 390.0
-        logger.debug(f"min_adv_percent: {self.min_adv_pct}, max_adv_percent: {self.max_adv_pct}, Percentage of day for time horizon: {pct_of_day}")
+    def _build_availability_matrix(self, stocks: List[str], dates: List[date]) -> np.ndarray:
+        """
+        Build matrix of available minutes for each stock-date combination.
+        @param stocks: List of stock symbols
+        @param dates: List of dates
+        @return: 2D numpy array (stocks x dates) with minute counts
+        """
+        availability_matrix = np.zeros((len(stocks), len(dates)), dtype=int)
+
+        print(f"Availability Matrix Stocks: {stocks[0]} to {stocks[-1]}")
+        print(f"Availability Matrix Dates: {dates[0]} to {dates[-1]}")
+        
+        for i, stock in enumerate(stocks):
+            df = self.stock_df_list[stock]
+            
+            for j, date in enumerate(dates):
+                if 'date' in df.columns:
+                    minutes = len(df[df['date'] == date])
+                elif hasattr(df.index, 'date'):
+                    minutes = (df.index.date == date).sum()
+                else:
+                    minutes = (df.index == date).sum()
+                
+                availability_matrix[i, j] = minutes
+        
+        return availability_matrix
+
+    def _sample_valid_orders(self, availability_matrix: np.ndarray, adv_matrix: np.ndarray,
+                           stocks: List[str], dates: List[date], num_orders: int, 
+                           rng: np.random.RandomState) -> Dict:
+        """
+        Sample valid stock-date pairs for order generation.
+        @param availability_matrix: Matrix of available minutes
+        @param adv_matrix: Matrix of ADV values
+        @param stocks: List of stock symbols
+        @param dates: List of dates
+        @param num_orders: Number of orders to generate
+        @param rng: Random number generator
+        @return: Dictionary with order data
+        """
+        # Find valid stock-date pairs (where we have both data and ADV)
+        valid_pairs = np.argwhere((availability_matrix > 0) & (adv_matrix > 0))
+        
+        if len(valid_pairs) == 0:
+            # Debug information to help diagnose the issue
+            availability_count = np.sum(availability_matrix > 0)
+            adv_count = np.sum(adv_matrix > 0)
+            total_pairs = availability_matrix.size
+            
+            logger.error(f"No valid stock-date pairs found:")
+            logger.error(f"  Availability matrix: {availability_count}/{total_pairs} non-zero entries")
+            logger.error(f"  ADV matrix: {adv_count}/{total_pairs} non-zero entries")
+            logger.error(f"  Stocks: {len(stocks)} - {stocks[:5]}{'...' if len(stocks) > 5 else ''}")
+            logger.error(f"  Dates: {len(dates)} - {dates[:5]}{'...' if len(dates) > 5 else ''}")
+            
+            # Show some sample values from each matrix
+            if availability_matrix.size > 0:
+                logger.error(f"  Availability matrix sample: {availability_matrix[:min(3, availability_matrix.shape[0]), :min(3, availability_matrix.shape[1])]}")
+            if adv_matrix.size > 0:
+                logger.error(f"  ADV matrix sample: {adv_matrix[:min(3, adv_matrix.shape[0]), :min(3, adv_matrix.shape[1])]}")
+            
+            raise ValueError("No valid stock-date pairs found with both data and ADV")
+        
+        # Oversample by 20% to ensure we get enough valid orders
+        num_to_generate = int(num_orders * 1.2)
+        sampled_indices = rng.choice(len(valid_pairs), size=num_to_generate, replace=True)
+        
+        # Extract stock and date indices
+        stock_indices = valid_pairs[sampled_indices, 0]
+        date_indices = valid_pairs[sampled_indices, 1]
+        
+        # Get actual values
+        order_stocks = [stocks[i] for i in stock_indices]
+        order_dates = [dates[i] for i in date_indices]
+        order_minutes = availability_matrix[stock_indices, date_indices]
+        order_advs = adv_matrix[stock_indices, date_indices]
+        
+        # Filter and truncate
+        valid_mask = (order_minutes > 0) & (order_advs > 0)
+        order_stocks = [s for s, v in zip(order_stocks, valid_mask) if v][:num_orders]
+        order_dates = [d for d, v in zip(order_dates, valid_mask) if v][:num_orders]
+        order_minutes = order_minutes[valid_mask][:num_orders]
+        order_advs = order_advs[valid_mask][:num_orders]
+        
+        return {
+            'stocks': order_stocks,
+            'dates': order_dates,
+            'minutes': order_minutes,
+            'advs': order_advs
+        }
+
+    def _generate_order_parameters(self, order_minutes: np.ndarray, order_advs: np.ndarray, 
+                                 num_orders: int, rng: np.random.RandomState) -> Dict:
+        """
+        Generate random parameters for orders (time horizons, quantities, etc).
+        @param order_minutes: Available minutes for each order
+        @param order_advs: ADV values for each order
+        @param num_orders: Number of orders
+        @param rng: Random number generator
+        @return: Dictionary with order parameters
+        """
+        # Generate time horizons
+        max_horizons = np.minimum(self.max_time_horizon, order_minutes)
+        time_horizons = rng.randint(self.min_time_horizon, max_horizons + 1)
+        
+        # Generate start times
+        max_starts = np.maximum(0, order_minutes - time_horizons)
+        uniform_randoms = rng.random(num_orders)
+        start_times = (uniform_randoms * (max_starts + 1)).astype(int)
+        end_times = start_times + time_horizons
+        
+        # Calculate order sizes
+        pct_of_day = np.maximum(time_horizons / order_minutes, 0.001)
         min_ehv_pct = self.min_adv_pct * pct_of_day
         max_ehv_pct = self.max_adv_pct * pct_of_day
         
-        # select random percentages of ADV for each order - use actual number of orders
-        adv_pct = np.random.uniform(min_ehv_pct, max_ehv_pct, size=actual_num_orders)
-        logger.debug(f"Selected ADV percentages: {adv_pct}")
-
-        # compute fractional quantities using the stocks that were actually used
-        fractional_qty_series = advs.reindex(order_stocks) * adv_pct
+        adv_pct = rng.uniform(min_ehv_pct, max_ehv_pct, size=num_orders)
+        order_quantities = np.round(order_advs * adv_pct).astype(int)
+        sides = rng.choice(['buy', 'sell'], size=num_orders)
         
-        # now np.round will work
-        order_quantities = (fractional_qty_series.round(0).astype(int).to_numpy())  
+        return {
+            'time_horizons': time_horizons,
+            'start_times': start_times,
+            'end_times': end_times,
+            'adv_pct': adv_pct,
+            'ehv_pct': adv_pct / pct_of_day,
+            'order_quantities': order_quantities,
+            'sides': sides
+        }
 
-        # Log before rounding to see the fractional quantities
-        logger.debug(f"Calculated fractional order quantities: {order_quantities}")
-
-
-        # Check for zero quantities
-        if (order_quantities == 0).any():
-            zero_indices = np.where(order_quantities == 0)[0]
-            logger.warning(f"Found {len(zero_indices)} orders with quantity 0 after rounding.")
-            for i in zero_indices:
-                stock_ticker = order_stocks[i]
-                original_qty = order_quantities[i] * adv_pct[i]
-                logger.warning(f"  - Order for ticker {stock_ticker}:")
-                logger.warning(f"    - ADV: {order_quantities[i]:.2f}, ADV_pct: {adv_pct[i]:.6f}")
-                logger.warning(f"    - Fractional Qty before rounding: {original_qty:.4f}")
-        
-
-        # select random sides (buy/sell) - use actual number of orders
-        sides = np.random.choice(['buy', 'sell'], size=actual_num_orders)
-        
-        # create a DataFrame with the generated orders
+    def _create_orders_dataframe(self, valid_orders_data: Dict, order_params: Dict) -> pd.DataFrame:
+        """
+        Create the orders DataFrame from order data and parameters.
+        @param valid_orders_data: Dictionary with stocks, dates, minutes, advs
+        @param order_params: Dictionary with order parameters
+        @return: Orders DataFrame
+        """
         orders_df = pd.DataFrame({
-            'ticker': order_stocks,
-            'order_qty': order_quantities,
-            'adv_pct': adv_pct, # percentage of ADV for each order
-            'ehv_pct': adv_pct/pct_of_day, # percentage of expected horizon volume (EHV)
-            'adv': advs.reindex(order_stocks).to_numpy(),
-            'date': order_dates,  # Add the date field
-            'start_time': start_times,
-            'end_time': end_times,
-            'time_horizon': time_horizons,
-            'side': sides
+            'ticker': valid_orders_data['stocks'],
+            'order_qty': order_params['order_quantities'],
+            'adv_pct': order_params['adv_pct'],
+            'ehv_pct': order_params['ehv_pct'],
+            'adv': valid_orders_data['advs'],
+            'date': valid_orders_data['dates'],
+            'start_time': order_params['start_times'],
+            'end_time': order_params['end_times'],
+            'time_horizon': order_params['time_horizons'],
+            'side': order_params['sides'],
+            # Initialize all analytics columns
+            'avg_spread_21_days': 0.0,
+            'avg_depth_21_days': 0.0,
+            'daily_volatility': 0.0,
+            'daily_volatility_lag1': 0.0,
+            'daily_volatility_5d': 0.0,
+            'daily_vwap': 0.0,
+            'intra_order_return': 0.0,
+            'adv_21_days': 0.0,
+            'avg_trade_count_21_days': 0.0
         })
         
-        # Add today's volatility and intra-order return for each order
-        for i, (ticker, date) in enumerate(zip(order_stocks, order_dates)):
-            df = self.stock_df_list[ticker]
-            # Filter data for the specific date
-            date_data = df[df.index.date == pd.to_datetime(date).date()]
-            
-            # Calculate intra-order return (from start to end of the order)
-            start_price = date_data.iloc[start_times[i]]['Open']
-            end_price = date_data.iloc[end_times[i] - 1]['Close']  # -1 because end_time is exclusive
-            intra_return = (end_price - start_price) / start_price
-            orders_df.loc[i, 'intra_order_return'] = intra_return
-            # Use existing DailyVol from market data for that date
-            orders_df.loc[i, 'today_volatility'] = date_data['DailyVol'].iloc[0]
-        
-        logger.debug(f"Generated orders DataFrame:\n{orders_df}")
-        logger.debug(f"Orders per date distribution:\n{orders_df['date'].value_counts().sort_index()}")
         return orders_df
-    
 
-    def _calculate_advs(self):
+    def _load_analytics_data(self, orders_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate the average daily volume (ADV) for each stock in the stock_df_list.
-        @return: Series containing the ADV for each stock.
+        Load analytics data for all orders.
+        @param orders_df: Orders DataFrame
+        @return: Orders DataFrame with analytics data
         """
+        # Get unique ticker-date pairs
+        unique_pairs = orders_df[['ticker', 'date']].drop_duplicates()
+        symbol_date_pairs = list(unique_pairs.itertuples(index=False, name=None))
         
-        advs = {}
-        for ticker, df in self.stock_df_list.items():
-            # sum the volume, group by date, and take the mean
-            daily_volume = df['Volume'].groupby(df.index.date).sum()
-            adv = daily_volume.mean()
-            advs[ticker] = adv
+        # Bulk load all analytics at once
+        analytics_dict = self.analytics.get_analytics_bulk(symbol_date_pairs)
+        
+        if analytics_dict:
+            # Create a mapping for fast lookup
+            def get_analytics_value(row, field):
+                key = (row['ticker'], row['date'])
+                if key in analytics_dict:
+                    return analytics_dict[key].get(field, 0.0)
+                return 0.0
             
-        return pd.Series(advs)
-    
+            # Apply to all analytics columns
+            analytics_cols = {
+                'adv_21_days': 'adv_21_days',
+                'avg_spread_21_days': 'avg_spread_21_days',
+                'avg_trade_count_21_days': 'avg_trade_count_21_days',
+                'avg_depth_21_days': 'avg_depth_21_days',
+                'daily_volatility': 'daily_volatility',
+                'daily_volatility_lag1': 'daily_volatility_lag1',
+                'daily_volatility_5d': 'daily_volatility_5d',
+                'daily_vwap': 'vwap'
+            }
+            
+            for df_col, analytics_col in analytics_cols.items():
+                orders_df[df_col] = orders_df.apply(
+                    lambda row: get_analytics_value(row, analytics_col), axis=1
+                )
+        
+        return orders_df
+
+    def _load_propagator_params(self, orders_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Load propagator parameters (Y and tau) for all orders using vectorized operations.
+
+        Args:
+            orders_df: Orders DataFrame
+            fallback_days: Number of days to use for fallback if no propagator parameters are found
+
+        Returns:    
+            Orders DataFrame with Y and tau columns added
+
+        """
+        if self.propagator_loader is None:
+            logger.info("No propagator loader provided, skipping Y and tau parameter loading")
+            return orders_df
+            
+        logger.info("Loading propagator parameters (Y and tau)...")
+        
+        # Get unique ticker-date pairs for batch loading
+        unique_pairs = orders_df[['ticker', 'date']].drop_duplicates()
+        
+        if unique_pairs.empty:
+            logger.warning("No unique ticker-date pairs found")
+            orders_df['Y'] = np.nan
+            orders_df['tau'] = np.nan
+            return orders_df
+        
+        # Convert to list of (symbol, date) tuples for batch loading
+        symbol_date_pairs = [(row['ticker'], row['date']) for _, row in unique_pairs.iterrows()]
+        
+        # Batch load all parameters at once
+        try:
+            params_dict = self.propagator_loader.get_params_batch(
+                symbol_date_pairs,
+                fallback_days=5,
+                y_column=self.y_column,
+                tau_column=self.tau_column
+            )
+
+            # Convert to DataFrame for efficient merging
+            params_data = []
+            for (symbol, date), (Y, tau) in params_dict.items():
+                params_data.append({
+                    'ticker': symbol,
+                    'date': date,
+                    'Y': Y,
+                    'tau': tau
+                })
+            
+            if params_data:
+                params_df = pd.DataFrame(params_data)
+                
+                orders_df['date'] = pd.to_datetime(orders_df['date']).dt.date
+                params_df['date'] = pd.to_datetime(params_df['date'], format='%Y%m%d', errors='coerce').dt.date
+
+                # Vectorized merge - much faster than apply()
+                orders_df = orders_df.merge(
+                    params_df[['ticker', 'date', 'Y', 'tau']], 
+                    on=['ticker', 'date'], 
+                    how='left'
+                )
+
+            else:
+                logger.warning("No propagator parameters loaded")
+                orders_df['Y'] = np.nan
+                orders_df['tau'] = np.nan
+                
+        except Exception as e:
+            logger.error(f"Failed to batch load propagator parameters: {e}")
+            orders_df['Y'] = np.nan
+            orders_df['tau'] = np.nan
+            return orders_df
+        
+        # Log statistics
+        Y_count = orders_df['Y'].notna().sum()
+        tau_count = orders_df['tau'].notna().sum()
+        total_orders = len(orders_df)
+        
+        logger.info(f"Loaded Y parameters for {Y_count}/{total_orders} orders ({Y_count/total_orders*100:.1f}%)")
+        logger.info(f"Loaded tau parameters for {tau_count}/{total_orders} orders ({tau_count/total_orders*100:.1f}%)")
+        
+        if Y_count > 0:
+            Y_stats = orders_df['Y'].describe()
+            logger.info(f"Y statistics: mean={Y_stats['mean']:.6f}, std={Y_stats['std']:.6f}, range=[{Y_stats['min']:.6f}, {Y_stats['max']:.6f}]")
+        
+        if tau_count > 0:
+            tau_stats = orders_df['tau'].describe()
+            logger.info(f"tau statistics: mean={tau_stats['mean']:.2f}, std={tau_stats['std']:.2f}, range=[{tau_stats['min']:.2f}, {tau_stats['max']:.2f}]")
+        
+        return orders_df
+
+    def _calculate_intra_order_returns(self, orders_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate intra-order returns for all orders.
+        @param orders_df: Orders DataFrame
+        @return: Orders DataFrame with intra_order_return calculated
+        """
+        # Group by ticker-date for efficient processing
+        for (ticker, date), group_indices in orders_df.groupby(['ticker', 'date']).groups.items():
+            df = self.stock_df_list[ticker]
+            
+            # Get data for this date
+            if 'date' in df.columns:
+                date_data = df[df['date'] == date]
+            elif hasattr(df.index, 'date'):
+                date_data = df[df.index.date == date]
+            else:
+                date_data = df[df.index == date]
+            
+            if date_data.empty or 'bid_price' not in date_data.columns or 'ask_price' not in date_data.columns:
+                continue
+            
+            # Calculate returns for each order in this group
+            for idx in group_indices:
+                row = orders_df.loc[idx]
+                start_idx = min(row['start_time'], len(date_data) - 1)
+                end_idx = min(row['end_time'] - 1, len(date_data) - 1)
+                
+                if start_idx >= 0 and end_idx >= 0 and end_idx > start_idx:
+                    try:
+                        bid_start = date_data.iloc[start_idx]['bid_price']
+                        ask_start = date_data.iloc[start_idx]['ask_price']
+                        bid_end = date_data.iloc[end_idx]['bid_price']
+                        ask_end = date_data.iloc[end_idx]['ask_price']
+                        
+                        if bid_start > 0 and ask_start > 0 and bid_end > 0 and ask_end > 0:
+                            mid_start = (bid_start + ask_start) / 2
+                            mid_end = (bid_end + ask_end) / 2
+                            intra_return = (mid_end - mid_start) / mid_start
+                            orders_df.loc[idx, 'intra_order_return'] = intra_return
+                    except Exception as e:
+                        logger.debug(f"Error calculating return for {ticker} order {idx}: {e}")
+        
+        return orders_df
+
+    @staticmethod
+    def get_dates_from_dataframe(df):
+        """
+        Extract dates from a DataFrame, handling both date-as-column and date-as-index cases.
+        @param df: DataFrame to extract dates from
+        @return: Array of unique dates
+        """
+        if 'date' in df.columns:
+            # Date is a column
+            return df['date'].unique()
+        elif hasattr(df.index, 'date'):
+            # Date is index (DatetimeIndex) - extract date part
+            return pd.Series(df.index.date).unique()
+        elif df.index.name == 'date':
+            # Index is named 'date' and contains date objects directly
+            return pd.Series(df.index).unique()
+        else:
+            # Try to find any date-like columns
+            date_cols = [col for col in df.columns if 'date' in col.lower()]
+            
+            if date_cols:
+                return df[date_cols[0]].unique()
+            else:
+                raise ValueError("Cannot find date information in DataFrame - no date column or datetime index")
 
     def get_orders(self):
         """
