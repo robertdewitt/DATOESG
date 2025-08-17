@@ -390,34 +390,27 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
             test_means.append(mean_val)
             test_errors.append(std_error)
     
-    # Create line plot with error bands
+    # Create line plot with actual dates on x-axis
     if train_dates:
-        x_train = range(len(train_dates))
+        x_train = pd.to_datetime(train_dates)
         axes[plot_idx].plot(x_train, train_means, 'o-', color='blue', label=a_name, linewidth=2, markersize=4)
-        axes[plot_idx].fill_between(x_train, 
-                                   [m - e for m, e in zip(train_means, train_errors)], 
-                                   [m + e for m, e in zip(train_means, train_errors)], 
+        axes[plot_idx].fill_between(x_train,
+                                   [m - e for m, e in zip(train_means, train_errors)],
+                                   [m + e for m, e in zip(train_means, train_errors)],
                                    color='blue', alpha=0.2)
     
     if b_df is not None and test_dates:
-        x_test = range(len(test_dates))
+        x_test = pd.to_datetime(test_dates)
         axes[plot_idx].plot(x_test, test_means, 's-', color='orange', label=b_name, linewidth=2, markersize=4)
-        axes[plot_idx].fill_between(x_test, 
-                                   [m - e for m, e in zip(test_means, test_errors)], 
-                                   [m + e for m, e in zip(test_means, test_errors)], 
+        axes[plot_idx].fill_between(x_test,
+                                   [m - e for m, e in zip(test_means, test_errors)],
+                                   [m + e for m, e in zip(test_means, test_errors)],
                                    color='orange', alpha=0.2)
     
     axes[plot_idx].set_title('ADV Percentage by Date (Mean ± Standard Error)')
     axes[plot_idx].set_xlabel('Date')
     axes[plot_idx].set_ylabel('ADV Percentage (%)')
     axes[plot_idx].grid(True, alpha=0.3)
-    
-    # Set x-ticks and labels
-    if train_dates or (b_df is not None and test_dates):
-        # Use the longer date list for x-axis
-        main_dates = train_dates if len(train_dates) >= len(test_dates if test_dates else []) else test_dates
-        axes[plot_idx].set_xticks(range(len(main_dates)))
-        axes[plot_idx].set_xticklabels([str(d) for d in main_dates], rotation=45, ha='right')
     
     # Add legend
     axes[plot_idx].legend()

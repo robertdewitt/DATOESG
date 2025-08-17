@@ -23,23 +23,26 @@ class OrderGenerator:
                  y_column: str = 'Y', tau_column: str = 'tau'):
         """
         Initialize the OrderGenerator with a random DataFrame of orders.
-        @param stock_df_list: List of DataFrames containing stock data.
-        @param market_data: Instance of MarketDataLoader to fetch market data.
-        @param num_orders: Number of random orders to generate.
-        @param min_adv_pct: Minimum percentage of ADV for orders.
-        @param max_adv_pct: Maximum percentage of ADV for orders.
-        @param min_time_horizon: Minimum time horizon for orders in minutes.
-        @param max_time_horizon: Maximum time horizon for orders in minutes.
-        @param sd_delta: Start date delta - number of days to shift the start date of the order generation.
-        @param ed_delta: End date delta - number of days to shift the end date of the order generation.
-        @param md_source: Source of market data - 'yfinance' or 'mana'.
-        @param debug: Enable debug logging.
-        @param seed: Random seed for reproducibility.
-        @param analytics: QuoteAndTradeAnalytics instance with pre-loaded analytics data.
-        @param propagator_loader: PropagatorParamLoader instance for Y and tau parameters (optional).
-        @param y_column: Column name for Y parameter in propagator data (default: 'Y').
-        @param tau_column: Column name for tau parameter in propagator data (default: 'tau').
-        @return: None
+        Args:
+            stock_df_list: List of DataFrames containing stock data.
+            market_data: Instance of MarketDataLoader to fetch market data.
+            num_orders: Number of random orders to generate.
+            min_adv_pct: Minimum percentage of ADV for orders.
+            max_adv_pct: Maximum percentage of ADV for orders.
+            min_time_horizon: Minimum time horizon for orders in minutes.   
+            max_time_horizon: Maximum time horizon for orders in minutes.
+            sd_delta: Start date delta - number of days to shift the start date of the order generation.
+            ed_delta: End date delta - number of days to shift the end date of the order generation.
+            md_source: Source of market data - 'yfinance' or 'mana'.
+            debug: Enable debug logging.
+            seed: Random seed for reproducibility.
+            analytics: QuoteAndTradeAnalytics instance with pre-loaded analytics data.
+            propagator_loader: PropagatorParamLoader instance for Y and tau parameters (optional).
+            y_column: Column name for Y parameter in propagator data (default: 'Y').
+            tau_column: Column name for tau parameter in propagator data (default: 'tau').
+            dates: List of dates to generate orders for.
+        Returns:
+            None
         """
         # Set logging level based on debug parameter
         if debug:
@@ -79,6 +82,8 @@ class OrderGenerator:
         """
         Generate a dataframe of random orders based on the stock data.
         Optimized version using vectorized operations throughout.
+        Returns:
+            orders_df: DataFrame containing the generated orders.
         """
         import time
         start_time = time.time()

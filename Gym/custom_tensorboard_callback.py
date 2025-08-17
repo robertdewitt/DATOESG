@@ -204,6 +204,13 @@ class EnvironmentStatsCallback(BaseCallback):
                 if 'shares_remaining' in info and 'order_qty' in info:
                     completion_ratio = 1 - (info['shares_remaining'] / info['order_qty'])
                     self.logger.record("env/completion_ratio", completion_ratio)
+
+                # Log cost components if provided
+                for key in [
+                    'trade_cost', 'rate_penalty', 'unfilled_cost',
+                    'holding_risk_cost', 'total_step_cost', 'step_reward']:
+                    if key in info:
+                        self.logger.record(f"env/{key}", info[key])
         
         return True
 

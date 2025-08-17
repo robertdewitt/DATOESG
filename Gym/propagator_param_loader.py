@@ -38,7 +38,7 @@ class PropagatorParamLoader:
     impact propagates and decays over time.
     """
     
-    def __init__(self, data_dir: str = "mana_archive/propagator_model_data",
+    def __init__(self, data_dir: str = "mana_archive/propagator_model_data_cross_validation",
             date_format: str = "%Y%m%d"):
         """
         Initialize the propagator parameter loader.
@@ -49,13 +49,14 @@ class PropagatorParamLoader:
         """
         self.data_dir = data_dir
         self.date_format = date_format
-        
+        self.df_params = None
+
         # Validate data directory exists
         if not os.path.exists(data_dir):
             raise FileNotFoundError(f"Propagator data directory not found: {data_dir}")
         
         # Get available symbols
-        self.available_symbols = self.PropagatorParamLoader()
+        self.available_symbols = self._get_available_symbols()
         logger.info(f"PropagatorParamLoader initialized with {len(self.available_symbols)} symbols")
     
     def _get_available_symbols(self) -> List[str]:
@@ -117,7 +118,7 @@ class PropagatorParamLoader:
         )
     
     def _load_params_from_file(self, symbol: str, date_str: str, 
-                              y_column: str = 'Y_median_63', tau_column: str = 'tau_pos_median_63_15') -> Tuple[float, float]:
+                              y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Tuple[float, float]:
         """
         Load Y and tau parameters from parquet file.
         
@@ -185,7 +186,7 @@ class PropagatorParamLoader:
             raise
     
     def get_params(self, symbol: str, date_input: Union[str, date, datetime], 
-                   fallback_days: int = 5, y_column: str = 'Y_median_63', tau_column: str = 'tau_pos_median_63_15') -> Tuple[float, float]:
+                   fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Tuple[float, float]:
         """
         Get Y and tau parameters for a specific symbol and date.
         
@@ -193,8 +194,8 @@ class PropagatorParamLoader:
             symbol: Stock symbol (e.g., 'AAPL')
             date_input: Date as string, date object, or datetime object
             fallback_days: Number of days to search backward if exact date not found
-            y_column: Name of the Y (immediate impact) column (default: 'Y_median_63')
-            tau_column: Name of the tau (decay rate) column (default: 'tau_pos_median_63_15')
+            y_column: Name of the Y (immediate impact) column (default: 'Y_best')
+            tau_column: Name of the tau (decay rate) column (default: 'tau_best')
             
         Returns:
             Tuple of (Y, tau) parameters
@@ -233,16 +234,16 @@ class PropagatorParamLoader:
             )
     
     def get_params_batch(self, symbol_date_pairs: List[Tuple[str, Union[str, date, datetime]]], 
-                        fallback_days: int = 5, y_column: str = 'Y_median_63', tau_column: str = 'tau_pos_median_63_15') -> Dict[Tuple[str, str], Tuple[float, float]]:
+                        fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Dict[Tuple[str, str], Tuple[float, float]]:
         """
         Get parameters for multiple (symbol, date) pairs efficiently.
         
         Args:
             symbol_date_pairs: List of (symbol, date) tuples
             fallback_days: Number of days to search backward if exact date not found
-            y_column: Name of the Y (immediate impact) column (default: 'Y_median_63')
+            y_column: Name of the Y (immediate impact) column (default: 'Y_best')
             
-            tau_column: Name of the tau (decay rate) column (default: 'tau_pos_median_63_15')
+            tau_column: Name of the tau (decay rate) column (default: 'tau_best')
             
         Returns:
             Dictionary mapping (symbol, normalized_date) to (Y, tau) parameters

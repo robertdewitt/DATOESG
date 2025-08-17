@@ -21,23 +21,28 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, stock_df_list, orders_df, impact_coef, decay_rate, num_envs, 
-                 min_rate=0.0, max_rate=0.1, window_size=1, unfilled_penalty=1e6, 
+                 min_rate=0.0, max_rate=0.1, risk_lambda=0.0, window_size=1, unfilled_penalty=1, 
                  device: Optional[str] = None, render_mode=None, seed=None):
         """
         Initialize the Vectorized Optimal Execution Environment.
         
-        @param stock_df_list: List of DataFrames containing stock data
-        @param orders_df: DataFrame containing orders (may include 'Y' and 'tau' columns for per-order parameters)
-        @param impact_coef: Immediate impact coefficient (γ) - used as fallback if orders_df lacks 'Y' column
-        @param decay_rate: Residual decay factor (κ) - used as fallback if orders_df lacks 'tau' column
-        @param num_envs: Number of parallel environments
-        @param min_rate: Minimum fraction of volume that can be traded
-        @param max_rate: Maximum fraction of volume that can be traded
-        @param window_size: Number of steps to consider for residual impact decay
-        @param unfilled_penalty: Penalty for unfilled orders
-        @param device: Device to use for tensor operations
-        @param render_mode: Render mode for the environment
-        @param seed: Random seed for reproducibility
+        Args:
+            stock_df_list: List of DataFrames containing stock data
+            orders_df: DataFrame containing orders (may include 'Y' and 'tau' columns for per-order parameters)
+            impact_coef: Immediate impact coefficient (γ) - used as fallback if orders_df lacks 'Y' column
+            decay_rate: Residual decay factor (κ) - used as fallback if orders_df lacks 'tau' column
+            num_envs: Number of parallel environments
+            min_rate: Minimum fraction of volume that can be traded 
+            max_rate: Maximum fraction of volume that can be traded
+            risk_lambda: Risk penalty factor for risk-adjusted returns (default: 0.0)
+            window_size: Number of steps to consider for residual impact decay
+            unfilled_penalty: Penalty for unfilled orders
+            device: Device to use for tensor operations
+            render_mode: Render mode for the environment
+            seed: Random seed for reproducibility
+
+        Returns:
+            None
         """
         # Device selection: explicit > MPS > CUDA > CPU
         # Force CPU for compatibility with training environment unless explicitly specified
@@ -92,11 +97,15 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             dtype=torch.float32, device=self.device
         )
 
+        self.risk_lambda = torch.tensor(risk_lambda, device=self.device, dtype=torch.float32)
+
         # Initialize vectorized state variables
         self._init_vectorized_state()
         
         # Preload data arrays for fast access
         self._preload_data_arrays()
+
+        self.logged_errors = {}
 
     def _set_seed(self, seed):
         """
@@ -246,14 +255,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Set environment-specific impact parameters from orders_df or use defaults
         if 'Y' in order_rows.columns:
             Y_values = order_rows['Y'].values
-            # Check for NaN values and replace with median
-            nan_mask = pd.isna(Y_values)
-            if nan_mask.any():
-                valid_values = Y_values[~nan_mask]
+            # Check for NaN values or < 0 and replace with median
+            nan_non_positive_mask = pd.isna(Y_values) | (Y_values < 0)
+            if nan_non_positive_mask.any():
+                valid_values = Y_values[~nan_non_positive_mask]
                 if len(valid_values) > 0:
                     median_value = np.median(valid_values)
-                    logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
-                    Y_values = np.where(nan_mask, median_value, Y_values)
+                    logger.warning(f"Found {nan_non_positive_mask.sum()} NaN or non-positive Y values, replacing with median {median_value}")
+                    Y_values = np.where(nan_non_positive_mask, median_value, Y_values)
                 else:
                     logger.warning(f"All Y values are NaN, using default {self.impact_coef.item()}")
                     Y_values = np.full_like(Y_values, self.impact_coef.item())
@@ -264,14 +273,16 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             
         if 'tau' in order_rows.columns:
             tau_values = order_rows['tau'].values
-            # Check for NaN values and replace with median
-            nan_mask = pd.isna(tau_values)
-            if nan_mask.any():
-                valid_values = tau_values[~nan_mask]
+            # Check for NaN or non positiv evalues and replace with median
+            nan_non_positive_mask = pd.isna(tau_values) | (tau_values < 0)
+            if nan_non_positive_mask.any():
+                valid_values = tau_values[~nan_non_positive_mask]
                 if len(valid_values) > 0:
                     median_value = np.median(valid_values)
-                    logger.warning(f"Found {nan_mask.sum()} NaN tau values, replacing with median {median_value}")
-                    tau_values = np.where(nan_mask, median_value, tau_values)
+                    if 'tau_error' not in self.logged_errors:
+                        logger.warning(f"Found {nan_non_positive_mask.sum()} NaN or non-positive tau values, replacing with median {median_value}")
+                    tau_values = np.where(nan_non_positive_mask, median_value, tau_values)
+                    self.logged_errors['tau_error'] = True
                 else:
                     logger.warning(f"All tau values are NaN, using default {self.decay_rate.item()}")
                     tau_values = np.full_like(tau_values, self.decay_rate.item())
@@ -396,24 +407,25 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         """
         self.actions = torch.tensor(actions, device=self.device, dtype=torch.int64)
 
-    def _calculate_deterministic_impact(self, trade_sizes):
+
+    def _calculate_deterministic_impact(self, minute_pov):
         """
         Calculates the deterministic, immediate impact of a trade.
 
         Args:
             trade_sizes: Trade sizes for each environment
+            current_volumes: Current volumes for each environment
 
         Returns:
             Deterministic impact for each environment
         """
-        # TODO: use a volume profile for this to scale for intraday seasonality
-        minute_volume = self.adv / 390.0
-        epsilon = trade_sizes.float() / minute_volume
-        deterministic_impact = self.env_impact_coef * epsilon
+        # Ensure minute_pov is non-negative to avoid NaNs from sqrt
+        minute_pov_safe = torch.clamp(minute_pov, min=0.0001)
+        epsilon = self.side * torch.sqrt(minute_pov_safe)
+        # Deterministic immediate term is Y * ε_t
+        deterministic_impact = self.env_impact_coef * epsilon  
         
         return deterministic_impact
-
-
 
 
     def step_wait(self):
@@ -430,13 +442,33 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         current_volumes = market_data['trade_volume']
         vwap_prices = market_data['vwap']
         mid_prices = (market_data['trade_high'] + market_data['trade_low']) * 0.5
-        daily_sigma = market_data['daily_volatility_lag1']
+        # Clamp daily_sigma to be non-negative and log anomalies
+        raw_daily_sigma = market_data['daily_volatility_lag1']
+        bad_sigma_mask = (~torch.isfinite(raw_daily_sigma)) | (raw_daily_sigma < 0)
+        if torch.any(bad_sigma_mask):
+            sample_idx = torch.nonzero(bad_sigma_mask, as_tuple=False).view(-1)[:5].tolist()
+            logger.warning(f"daily_volatility_lag1 had {int(bad_sigma_mask.sum().item())} invalid values (neg or non-finite); sample idx={sample_idx}")
+        daily_sigma = torch.clamp(raw_daily_sigma, min=0.0001)
+        sigma_step = daily_sigma / torch.sqrt(torch.tensor(390.0, device=daily_sigma.device))
 
         # Compute trade sizes
         fractions = self.action_values[self.actions]
+        # Log if (1 + fractions) would be negative
+        raw_one_plus = 1.0 + fractions
+        if torch.any(raw_one_plus < 0):
+            sample_idx = torch.nonzero(raw_one_plus < 0, as_tuple=False).view(-1)[:5].tolist()
+            logger.warning(f"Action adjustment pushed (1 + fraction) negative for {int((raw_one_plus < 0).sum().item())} envs; clipping to 0. sample idx={sample_idx}")
+        # Log if ehv_pct has invalid values
+        if torch.any(~torch.isfinite(self.ehv_pct)) or torch.any(self.ehv_pct < 0):
+            bad_ehv_mask = (~torch.isfinite(self.ehv_pct)) | (self.ehv_pct < 0)
+            sample_idx = torch.nonzero(bad_ehv_mask, as_tuple=False).view(-1)[:5].tolist()
+            logger.warning(f"ehv_pct had {int(bad_ehv_mask.sum().item())} invalid values; clipping negatives to 0.001. sample idx={sample_idx}")
+        # Ensure positive participation of volume and non-negative EHV pct
+        ehv_pct_safe = torch.clamp(self.ehv_pct, min=0.001)
+        pov = ehv_pct_safe * torch.clamp(raw_one_plus, min=0.0)
         trade_sizes = torch.where(
             self.shares_remaining > 0, 
-            torch.min(self.ehv_pct * (1 + fractions) * current_volumes, self.shares_remaining.float()),
+            torch.min(pov * current_volumes, self.shares_remaining.float()),
             torch.zeros_like(self.shares_remaining, dtype=torch.float32)
         )
         trade_sizes = torch.round(trade_sizes).to(torch.int64)
@@ -446,8 +478,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.total_market_volume = torch.clamp(self.total_market_volume, min=1)
 
         # Compute impacts using environment-specific parameters
-        deterministic_impact = self._calculate_deterministic_impact(trade_sizes)
-        self.immediate_impact = deterministic_impact
+        self.immediate_impact = self._calculate_deterministic_impact(pov)
         
         # Residual impact decay using environment-specific parameters
         delta_t = torch.where(
@@ -455,13 +486,15 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             (self.current_step - self.last_trade_step).float(),
             torch.ones_like(self.current_step, dtype=torch.float32)
         )
-        lambda_decay = torch.exp(-delta_t / self.env_decay_rate)
-        self.accumulated_impact = lambda_decay * self.accumulated_impact + deterministic_impact
-        fill_prices = vwap_prices * (1 + self.side * self.accumulated_impact)
-
-        minutely_sigma = daily_sigma / np.sqrt(390.0)
-        stochastic_noise = torch.normal(mean=0.0, std=minutely_sigma)
-        total_log_return = deterministic_impact + stochastic_noise
+        # Avoid division by zero (or negative) in decay rate
+        if torch.any(~torch.isfinite(self.env_decay_rate)) or torch.any(self.env_decay_rate <= 0):
+            bad_tau_mask = (~torch.isfinite(self.env_decay_rate)) | (self.env_decay_rate <= 0)
+            sample_idx = torch.nonzero(bad_tau_mask, as_tuple=False).view(-1)[:5].tolist()
+            logger.warning(f"env_decay_rate (tau) had {int(bad_tau_mask.sum().item())} invalid values; clipping to min 0.5. sample idx={sample_idx}")
+        decay_rate_safe = torch.clamp(self.env_decay_rate, min=0.5)
+        lambda_decay = torch.exp(-delta_t / decay_rate_safe)
+        self.accumulated_impact = lambda_decay * self.accumulated_impact + self.immediate_impact
+        fill_prices = vwap_prices * (1 + self.accumulated_impact)
 
         # Update order VWAP
         prior_filled_qty = self.order_qty - self.shares_remaining
@@ -501,26 +534,68 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         truncated_mask = self.current_step >= self.time_horizon
         
         reward = torch.zeros(self.num_envs, device=self.device)
+
         
-        # Calculate slippage
+        
+        # Trade Cost: Calculate slippage
+        if torch.any(self.order_qty <= 0):
+            sample_idx = torch.nonzero(self.order_qty <= 0, as_tuple=False).view(-1)[:5].tolist()
+            logger.warning(f"order_qty had {int((self.order_qty <= 0).sum().item())} non-positive entries; divisions may be unstable. sample idx={sample_idx}")
+        if torch.any(~torch.isfinite(self.arrival_price)) or torch.any(self.arrival_price <= 0):
+            bad_arrival_mask = (~torch.isfinite(self.arrival_price)) | (self.arrival_price <= 0)
+            sample_idx = torch.nonzero(bad_arrival_mask, as_tuple=False).view(-1)[:5].tolist()
+            if 'arrival_error' not in self.logged_errors:
+                logger.warning(f"arrival_price had {int(bad_arrival_mask.sum().item())} invalid values; divisions may produce inf. sample idx={sample_idx}")
+                self.logged_errors['arrival_error'] = True
+        weight = trade_sizes / self.order_qty.float()
         price_performance = (fill_prices - self.arrival_price) / self.arrival_price
-        slippage = -self.side * price_performance * (trade_sizes / self.order_qty.float())
-        trade_cost = slippage
+        if torch.any(~torch.isfinite(price_performance)):
+            sample_idx = torch.nonzero(~torch.isfinite(price_performance), as_tuple=False).view(-1)[:5].tolist()
+            if 'price_performance_error' not in self.logged_errors:
+                logger.warning(f"price_performance produced non-finite values for {int((~torch.isfinite(price_performance)).sum().item())} envs; check arrival_price. sample idx={sample_idx}")
+                self.logged_errors['price_performance_error'] = True
+        trade_cost = self.side * price_performance * weight
 
         # Rate deviation penalty
-        target_completion_ratio = self.current_step.float() / self.time_horizon.float()
+        if torch.any(self.time_horizon <= 0):
+            sample_idx = torch.nonzero(self.time_horizon <= 0, as_tuple=False).view(-1)[:5].tolist()
+            if 'time_horizon_error' not in self.logged_errors:
+                logger.warning(f"time_horizon had {int((self.time_horizon <= 0).sum().item())} non-positive entries; clipping to 1. sample idx={sample_idx}")
+                self.logged_errors['time_horizon_error'] = True
+        time_horizon_safe = self.time_horizon.clamp_min(1).float()
+        target_completion_ratio = self.current_step.float() / time_horizon_safe
         actual_completion_ratio = (self.order_qty - self.shares_remaining).float() / self.order_qty.float()
         rate_deviation = actual_completion_ratio - target_completion_ratio
-        rate_penalty_coef = 0.001
-        rate_penalty = -rate_penalty_coef * torch.abs(rate_deviation) * (trade_sizes / self.order_qty.float())
+        # Penalize deviation using a minutely volatility scale
+        rate_penalty = sigma_step * torch.abs(rate_deviation)
 
         # Apply unfilled penalty
+        unfilled_cost = torch.zeros_like(trade_cost)
+        # use daily vol as a proxy for overnight holding cost
         if truncated_mask.any():
-            unfilled_ratio = self.shares_remaining[truncated_mask] / self.order_qty[truncated_mask]
-            reward[truncated_mask] += -self.unfilled_penalty * unfilled_ratio
+            unfilled_ratio = self.shares_remaining[truncated_mask].float() / self.order_qty[truncated_mask]
+            unfilled_cost[truncated_mask] = daily_sigma[truncated_mask] * unfilled_ratio
 
-        reward = trade_cost + rate_penalty
-        self.total_cost += reward
+        # holding risk penalty
+        holding_risk_cost = self.risk_lambda * sigma_step * (self.shares_remaining.float() 
+                    / self.order_qty.clamp_min(1).float()).abs()
+
+
+        # reward is the negative sum of the costs
+        total_step_cost = trade_cost + holding_risk_cost + rate_penalty + unfilled_cost
+        reward = -total_step_cost
+        # Guard against non-finite rewards propagating into training, with logging
+        if torch.any(~torch.isfinite(reward)):
+            sample_idx = torch.nonzero(~torch.isfinite(reward), as_tuple=False).view(-1)[:5].tolist()
+            if 'reward_error' not in self.logged_errors:
+                logger.warning(f"Non-finite rewards detected for {int((~torch.isfinite(reward)).sum().item())} envs; converting to 0. sample idx={sample_idx}")
+                self.logged_errors['reward_error'] = True
+        reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        self.total_cost = getattr(self, "total_cost", 0.0) + total_step_cost.detach().sum()
+
+        # Update done flags
+        self.done = truncated_mask
 
         # Update done flags
         self.done = truncated_mask
@@ -530,17 +605,34 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
 
         if not np.isfinite(obs).all():
             idx = np.where(~np.isfinite(obs))[0]
-            raise RuntimeError(f"step_asynch:Env returned non-finite features at idx={idx}, values={obs[idx]}")
+            raise RuntimeError(f"step_asynch:Env returned non-finite features at idx={idx},values={obs[idx]}")
 
         
         # Convert to numpy for VecEnv interface
         # Note: This is not strictly necessary, but keeps interface consistent
         obs_np = obs
         rewards_np = reward.cpu().numpy()
+        # Validate rewards are finite
+        if not np.isfinite(rewards_np).all():
+            raise RuntimeError(f"step_wait: non-finite rewards detected: {rewards_np[~np.isfinite(rewards_np)]}")
         dones_np = self.done.cpu().numpy()
-        # Create empty infos for each environment
-        # TODO: Populate with relevant info if needed
-        infos = [{} for _ in range(self.num_envs)]
+        # Populate infos per environment with cost components for TensorBoard logging
+        infos = []
+        for i in range(self.num_envs):
+            infos.append({
+                'shares_remaining': self.shares_remaining[i].item(),
+                'order_vwap': self.order_vwap[i].item(),
+                'arrival_price': self.arrival_price[i].item(),
+                'immediate_impact': self.immediate_impact[i].item(),
+                'accumulated_impact': self.accumulated_impact[i].item(),
+                'action_percentage': float(self.last_action_fraction[i].item()),
+                'trade_cost': float(trade_cost[i].item()),
+                'rate_penalty': float(rate_penalty[i].item()),
+                'unfilled_cost': float(unfilled_cost[i].item()),
+                'holding_risk_cost': float(holding_risk_cost[i].item()),
+                'total_step_cost': float(total_step_cost[i].item()),
+                'step_reward': float(reward[i].item()),
+            })
 
         return obs_np, rewards_np, dones_np, infos
 
@@ -698,8 +790,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 self.step_async(actions)
                 obs, rewards, dones, infos = self.step_wait()
                 
-                # Get current market data for the first environment
-                market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low'], use_prior_step=False)
+                # Get market data for the bin in which the trade executed (prior step after step_wait)
+                market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low'], use_prior_step=True)
                 current_trade_volume = market_data['trade_volume'][env_idx].item()
                 vwap_price = market_data['vwap'][env_idx].item()
                 mid_price = ((market_data['trade_high'][env_idx] + market_data['trade_low'][env_idx]) * 0.5).item()
@@ -722,12 +814,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                     'accumulated_impact': self.accumulated_impact[env_idx].item(),
                     'arrival_price': self.arrival_price[env_idx].item(),
                     'order_vwap': self.order_vwap[env_idx].item(),
-                    'total_reward': self.total_cost[env_idx].item(),
+                    'total_cost': self.total_cost[env_idx].item(),
                     'action_percentage': float(self.last_action_fraction[env_idx].item()),
                     'adv': self.adv[env_idx].item(),
                     'current_step': step,
                     'episode': ep,
-                    'order_idx': ep,
                     # Add missing fields required by plotting functions
                     'mid_price': mid_price,
                     'vwap_price': vwap_price,
@@ -746,7 +837,13 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         return orders, order_indices_used
 
     def _reset_with_order_index(self, order_idx):
-        """Reset environment with a specific order index."""
+        """
+        Reset environment with a specific order index.
+        Args:
+            order_idx: The index of the order to reset the environment to.
+        Returns:
+            The initial observation of the environment.
+        """
         # Initialize _np_random if not already done
         if not hasattr(self, '_np_random') or self._np_random is None:
             self._np_random = np.random.RandomState(self._seed)
@@ -804,7 +901,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 valid_values = Y_values[~nan_mask]
                 if len(valid_values) > 0:
                     median_value = np.median(valid_values)
-                    logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
+                    if 'Y_error' in self.logged_errors:
+                        logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
+                        self.logged_errors['Y_error'] = True
                     Y_values = np.where(nan_mask, median_value, Y_values)
                 else:
                     logger.warning(f"All Y values are NaN, using default {self.impact_coef.item()}")
