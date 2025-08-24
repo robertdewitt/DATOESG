@@ -199,6 +199,8 @@ class EnvironmentStatsCallback(BaseCallback):
                 # Log action statistics
                 if 'action_percentage' in info:
                     self.logger.record("env/action_percentage", info['action_percentage'])
+                if 'action_pov' in info:
+                    self.logger.record("env/action_pov", info['action_pov'])
                 
                 # Log completion statistics
                 if 'shares_remaining' in info and 'order_qty' in info:
@@ -207,7 +209,7 @@ class EnvironmentStatsCallback(BaseCallback):
 
                 # Log cost components if provided
                 for key in [
-                    'trade_cost', 'rate_penalty', 'unfilled_cost',
+                    'arrival_cost', 'vwap_cost', 'rate_penalty', 'unfilled_cost',
                     'holding_risk_cost', 'total_step_cost', 'step_reward']:
                     if key in info:
                         self.logger.record(f"env/{key}", info[key])
