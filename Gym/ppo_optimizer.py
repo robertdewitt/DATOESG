@@ -129,6 +129,13 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
     def linear_schedule(progress_remaining: float) -> float:
         """Linear learning rate decay"""
         return progress_remaining
+    
+    def const_lr(lr: float):
+    return lambda _: lr
+
+                                                                                                        2Zdef scaled_lr(base: float):
+    # decays from base -> ~0 linearly
+    return lambda progress: base * progress
 
     # OPTIMIZATION 5: PPO hyperparameters
     model = PPO(
@@ -137,9 +144,9 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         device=device,  
         n_steps=n_steps,
         batch_size=2048,
-        learning_rate=linear_schedule if total_samples > 100000 else 3e-5,  
+        learning_rate=const_lr(3e-4),  
         n_epochs=n_epochs,
-        clip_range=0.05,  # Slightly higher for faster learning
+        clip_range=0.1,  # Slightly higher for faster learning
         clip_range_vf=None,  # No value function clipping (faster)
         gae_lambda=0.95,
         vf_coef=0.5,
@@ -151,8 +158,8 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         # Additional optimizations
         use_sde=False,  # Don't use state-dependent exploration (slower)
         sde_sample_freq=-1,
-        target_kl=0.005, 
-        ent_coef=0.03,
+        target_kl=0.02, 
+        ent_coef=0.02,
         stats_window_size=100,  # Smaller window for faster stats computation
     )
     
@@ -204,7 +211,7 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
     print(f"\nTraining {full_model_name} for {actual_train_steps:,} timesteps...")
     
     # OPTIMIZATION 6: Use compiled mode if available (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and torch.__version__ >= '2.0.0':
+    if hasattr(torch, 'compile') and torch.__version__ >= '2.0.0' and device != "cpu":
         print("Compiling model with torch.compile() for faster execution...")
         model.policy = torch.compile(model.policy, mode='reduce-overhead')
     
@@ -213,6 +220,7 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
         # Use all available cores
         num_threads = os.cpu_count()
         torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(1)
         print(f"Using {num_threads} CPU threads for training")
     
     # Train the model
