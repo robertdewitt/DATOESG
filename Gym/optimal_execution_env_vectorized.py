@@ -186,6 +186,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         
         # Trading state
         self.immediate_impact = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.immediate_impact_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.accumulated_impact = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.accumulated_impact_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.order_vwap = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.last_fill_price = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.last_trade_size = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
@@ -467,7 +470,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.last_fill_price.zero_()
         self.last_trade_size.zero_()
         self.immediate_impact.zero_()
+        self.immediate_impact_cost.zero_()
         self.accumulated_impact.zero_()
+        self.accumulated_impact_cost.zero_()
         self.order_vwap.zero_()
 
         # Return initial observations
@@ -725,6 +730,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.shares_remaining[idx]    = self.order_qty[idx]
         self.accumulated_impact[idx]  = 0.0
         self.immediate_impact[idx]    = 0.0
+        self.immediate_impact_cost[idx] = 0.0
+        self.accumulated_impact_cost[idx] = 0.0
         self.order_vwap[idx]          = 0.0
         self.last_fill_price[idx]     = 0.0
         self.last_trade_size[idx]     = 0
@@ -786,6 +793,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Assign immediate impact for this step
         self.immediate_impact = immediate_impact_per_minute
 
+
         # Residual impact decay using environment-specific parameters
         delta_t = torch.where(
             self.last_trade_step >= 0,
@@ -812,6 +820,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 self.immediate_impact[bad_idx].detach().cpu().numpy(),
                 povs_per_minute[bad_idx].detach().cpu().numpy(),
             )
+
+        self.immediate_impact_cost = self.immediate_impact.abs()
+        self.accumulated_impact_cost = self.accumulated_impact.abs()
 
         # Update order VWAP
         prior_filled_qty = self.order_qty - self.shares_remaining
@@ -940,8 +951,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'shares_remaining': self.shares_remaining[i].item(),
                 'order_vwap': self.order_vwap[i].item(),
                 'arrival_price': self.arrival_price[i].item(),
-                'immediate_impact': self.immediate_impact[i].item(),
-                'accumulated_impact': self.accumulated_impact[i].item(),
+                'immediate_impact_cost': self.immediate_impact_cost[i].item(),
+                'accumulated_impact_cost': self.accumulated_impact_cost[i].item(),
                 'action_percentage': float(self.last_action_fraction[i].item()),
                 'action_pov': float(action_pov[i].item()),
                 'arrival_cost': float(arrival_cost[i].item()),
@@ -1051,8 +1062,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             signal,
             self.last_fill_price,
             self.last_trade_size.float(),
-            self.immediate_impact,
-            self.accumulated_impact,
+            self.immediate_impact_cost,
+            self.accumulated_impact_cost,
             self.arrival_price,
             regime,
             vol_lag1,
@@ -1159,8 +1170,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'shares_remaining': torch.zeros((batch_size, max_horizon), device=self.device),
                 'last_fill_price': torch.zeros((batch_size, max_horizon), device=self.device),
                 'last_trade_size': torch.zeros((batch_size, max_horizon), device=self.device),
-                'immediate_impact': torch.zeros((batch_size, max_horizon), device=self.device),
-                'accumulated_impact': torch.zeros((batch_size, max_horizon), device=self.device),
+                'immediate_impact_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'accumulated_impact_cost': torch.zeros((batch_size, max_horizon), device=self.device),
                 'order_vwap': torch.zeros((batch_size, max_horizon), device=self.device),
                 'action_percentage': torch.zeros((batch_size, max_horizon), device=self.device),
                 'mid_price': torch.zeros((batch_size, max_horizon), device=self.device),
@@ -1221,8 +1232,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         step_data['shares_remaining'][i, step] = self.shares_remaining[i]
                         step_data['last_fill_price'][i, step] = self.last_fill_price[i]
                         step_data['last_trade_size'][i, step] = self.last_trade_size[i]
-                        step_data['immediate_impact'][i, step] = self.immediate_impact[i]
-                        step_data['accumulated_impact'][i, step] = self.accumulated_impact[i]
+                        step_data['immediate_impact_cost'][i, step] = self.immediate_impact_cost[i]
+                        step_data['accumulated_impact_cost'][i, step] = self.accumulated_impact_cost[i]
                         step_data['order_vwap'][i, step] = self.order_vwap[i]
                         step_data['action_percentage'][i, step] = self.last_action_fraction[i]
                         step_data['mid_price'][i, step] = (market_data['trade_high'][i] + market_data['trade_low'][i]) * 0.5
@@ -1249,8 +1260,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         'shares_remaining': step_data['shares_remaining'][i, s].item(),
                         'last_fill_price': step_data['last_fill_price'][i, s].item(),
                         'last_trade_size': step_data['last_trade_size'][i, s].item(),
-                        'immediate_impact': step_data['immediate_impact'][i, s].item(),
-                        'accumulated_impact': step_data['accumulated_impact'][i, s].item(),
+                        'immediate_impact_cost': step_data['immediate_impact_cost'][i, s].item(),
+                        'accumulated_impact_cost': step_data['accumulated_impact_cost'][i, s].item(),
                         'order_vwap': step_data['order_vwap'][i, s].item(),
                         'action_percentage': step_data['action_percentage'][i, s].item(),
                         'mid_price': step_data['mid_price'][i, s].item(),

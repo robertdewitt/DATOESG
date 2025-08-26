@@ -1,5 +1,6 @@
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import BaseCallback
 import torch.nn.functional as F
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize
@@ -8,7 +9,11 @@ import time
 import os
 import torch
 
-
+class LrCheck(BaseCallback):
+    def _on_rollout_end(self) -> bool:
+        lr = self.model.policy.optimizer.param_groups[0]["lr"]
+        self.logger.record("debug/optimizer_lr", float(lr))
+        return True
 
 class ExecFeaturesOptimized(BaseFeaturesExtractor):
     """
@@ -99,16 +104,13 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         batch_size = 2048
     else:
         batch_size = min(1024, total_samples)
-
-    # force batch_size for test
-    batch_size = 2048
     
     # Ensure divisibility
     while total_samples % batch_size != 0:
         batch_size = batch_size // 2
 
     # OPTIMIZATION 2: Reduced epochs for faster training
-    n_epochs = 6 # 3-5 is usually sufficient with large batches
+    n_epochs = 3 # 3-5 is usually sufficient with large batches
 
     # model_name to include settings
     full_model_name = f"{model_name}_nsteps_{n_steps}_batchsize_{batch_size}_epochs_{n_epochs}"
@@ -126,16 +128,10 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         )
     
     # OPTIMIZATION 4: Learning rate schedule
-    def linear_schedule(progress_remaining: float) -> float:
-        """Linear learning rate decay"""
-        return progress_remaining
-    
-    def const_lr(lr: float):
-    return lambda _: lr
-
-                                                                                                        2Zdef scaled_lr(base: float):
-    # decays from base -> ~0 linearly
-    return lambda progress: base * progress
+    def make_lr_schedule(base_lr):
+        def lr_schedule(progress_remaining: float) -> float:
+            return base_lr * progress_remaining     
+        return lr_schedule
 
     # OPTIMIZATION 5: PPO hyperparameters
     model = PPO(
@@ -144,10 +140,10 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         device=device,  
         n_steps=n_steps,
         batch_size=2048,
-        learning_rate=const_lr(3e-4),  
+        learning_rate=make_lr_schedule(3e-4),  
         n_epochs=n_epochs,
-        clip_range=0.1,  # Slightly higher for faster learning
-        clip_range_vf=None,  # No value function clipping (faster)
+        clip_range=0.2,  # Slightly higher for faster learning
+        clip_range_vf=0.2,  # No value function clipping (faster)
         gae_lambda=0.95,
         vf_coef=0.5,
         max_grad_norm=0.5,  # Slightly higher for stability
@@ -158,7 +154,7 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
         # Additional optimizations
         use_sde=False,  # Don't use state-dependent exploration (slower)
         sde_sample_freq=-1,
-        target_kl=0.02, 
+        target_kl=0.01, 
         ent_coef=0.02,
         stats_window_size=100,  # Smaller window for faster stats computation
     )
@@ -194,16 +190,20 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
         model: The trained model.
         train_time: The time it took to train the model.
 
-    """
-    
+    """    
     print(f"\n{'='*60}")
     print(f"OPTIMIZED PPO TRAINING: {model_name}")
     print(f"{'='*60}")
-    
+
     start_time = time.time()
+    
+    # Add callback to check optimizer lr
+    #callbacks = [LrCheck()] + (callbacks or [])
     
     # Create optimized model
     model, n_steps, batch_size, full_model_name = create_optimized_ppo_model(train_env, model_name)
+    print("optimizer lr at init:", model.policy.optimizer.param_groups[0]["lr"])
+
     
     # Calculate actual training steps
     actual_train_steps = num_train_steps
@@ -218,10 +218,16 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
     # OPTIMIZATION 7: Set torch threads for CPU training
     if model.device.type == 'cpu':
         # Use all available cores
-        num_threads = os.cpu_count()
-        torch.set_num_threads(num_threads)
-        torch.set_num_interop_threads(1)
-        print(f"Using {num_threads} CPU threads for training")
+        # Keep workers light; avoid CPU oversubscription with 256 envs
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        num_threads = min(os.cpu_count(), 16)
+        os.environ.setdefault("TORCH_NUM_THREADS",num_threads)           
+        os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
+        torch.set_num_threads(int(os.environ["TORCH_NUM_THREADS"]))
+        print(f"Using {int(num_threads)} CPU threads for training")
     
     # Train the model
     if mp_vec is not None:

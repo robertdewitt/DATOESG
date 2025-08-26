@@ -56,11 +56,14 @@ class StandardExecutionCostModel:
         Returns (total_cost, components_dict)
         """
 
+        slip_cap = 0.1              # ±10% max contribution per step
+
         # order quantity should never be 0; at very least, use 1.
         oq = order_qty.clamp_min(1).float()
 
         # Arrival cost
-        weight = trade_sizes.float() / oq
+        weight = (trade_sizes.float() / oq).clamp_min(0.0)
+
         # zero out any nans so they don't contribute to performance
         price_perf = torch.nan_to_num((fill_prices - arrival_price) / arrival_price, nan=0.0, posinf=0.0, neginf=0.0)
         arrival_cost = self.arrival_cost_weight * side.float() * price_perf * weight
@@ -107,6 +110,7 @@ class StandardExecutionCostModel:
         #logging.info(f"arrival_cost: {arrival_cost}, vwap_cost: {vwap_cost}, rate_penalty: {rate_penalty}, holding_risk_cost: {holding_risk_cost}, unfilled_cost: {unfilled_cost}")
 
         total_cost = arrival_cost + vwap_cost + rate_penalty + holding_risk_cost + unfilled_cost
+        total_cost = torch.clamp(total_cost, 0.0 - slip_cap, slip_cap)
 
         components = {
             'arrival_cost': arrival_cost,
