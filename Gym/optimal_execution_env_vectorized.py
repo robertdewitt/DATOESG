@@ -6,6 +6,7 @@ import logging
 from typing import Optional, Tuple, Dict, Any, List
 import platform
 import pandas as pd
+from tqdm import tqdm
 from stable_baselines3.common.vec_env import VecEnv
 from gpu_utils import get_torch_device, set_random_seed
 
@@ -17,6 +18,39 @@ MINUTES_PER_DAY = 390.0
 POV_CAP = 10.0 # Cap minutely POV at 10x volume
 
 # TODO: integrate minutely volume and volatility profiles 
+
+
+@torch.no_grad()
+def get_robust_arrival(
+    bid, ask, high, low, vwap, last,
+    p_bid, p_ask, p_high, p_low, p_vwap, p_last,
+    has_prev: torch.Tensor, eps: float = 1e-6,
+):
+    finite = torch.isfinite
+    def valid(x): return finite(x) & (x > 0)
+
+    mid_ba, mid_hl = (bid + ask)/2, (high + low)/2
+    arrival = torch.full_like(mid_ba, float('nan'))
+    for cand, mask in [(mid_ba, valid(bid)&valid(ask)),
+                       (mid_hl, valid(high)&valid(low)),
+                       (vwap,  valid(vwap))]:
+        arrival = torch.where(mask & ~valid(arrival), cand, arrival)
+
+    p_mid_ba, p_mid_hl = (p_bid + p_ask)/2, (p_high + p_low)/2
+    prev_pick = torch.full_like(arrival, float('nan'))
+    for cand, mask in [(p_mid_ba, valid(p_bid)&valid(p_ask)),
+                       (p_mid_hl, valid(p_high)&valid(p_low)),
+                       (p_vwap,  valid(p_vwap)),
+                       (p_last,  valid(p_last))]:
+        prev_pick = torch.where(mask & ~valid(prev_pick), cand, prev_pick)
+
+    use_prev = ~valid(arrival) & has_prev & valid(prev_pick)
+    arrival = torch.where(use_prev, prev_pick, arrival)
+
+    eps_t = arrival.new_tensor(eps)                 # no device arg needed
+    need_reseed = ~valid(arrival)
+    arrival = torch.where(need_reseed, eps_t, arrival)
+    return arrival, need_reseed
 
 
 class VectorizedMultiOrderExecutionEnv(VecEnv):
@@ -125,6 +159,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         np.random.seed(seed)
         set_random_seed(seed)
         
+
     def _init_vectorized_state(self):
         """
         Initialize all state variables for the vectorized environment.
@@ -159,12 +194,12 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.total_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.total_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         # Cumulative market VWAP components over the order interval
-        self.cum_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.cum_market_dollars = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         
         # Environment-specific propagator parameters (initialized with defaults, will be set in reset)
         self.env_impact_coef = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.env_decay_rate = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+
 
     def _preload_data_arrays(self):
         """
@@ -191,10 +226,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 vwap_values = ((df['trade_high'] + df['trade_low'] + df['trade_last']) / 3.0).to_numpy(dtype=np.float32)
         
             # Replace non-finite VWAP values with mid price; fall back to last price then zero
-            mid_prices = ((df['trade_high'] + df['trade_low']) / 2.0).to_numpy(dtype=np.float32)
+            mid_trade_prices = ((df['trade_high'] + df['trade_low']) / 2.0).to_numpy(dtype=np.float32)
+            mid_bid_ask_prices = ((df['bid_price'] + df['ask_price']) / 2.0).to_numpy(dtype=np.float32)
             last_prices = df['trade_last'].to_numpy(dtype=np.float32)
             # Mid fallback: if mid is non-finite, use last; if last non-finite, use 0
-            mid_safe = np.where(np.isfinite(mid_prices), mid_prices,
+            mid_safe = np.where(np.isfinite(mid_trade_prices), mid_trade_prices,
                                 np.where(np.isfinite(last_prices), last_prices, 0.0))
             vwap_values = np.where(np.isfinite(vwap_values), vwap_values, mid_safe)
             vwap_values = np.nan_to_num(vwap_values, nan=0.0, posinf=0.0, neginf=0.0)
@@ -203,6 +239,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'trade_high': safe_tensor(df['trade_high']),
                 'trade_low': safe_tensor(df['trade_low']),
                 'trade_last': safe_tensor(df['trade_last']),
+                'bid_price': safe_tensor(df['bid_price']),
+                'ask_price': safe_tensor(df['ask_price']),
                 'trade_volume': safe_tensor(df['trade_volume']),
                 'vwap': torch.tensor(vwap_values, device=self.device),
                 'Signal': safe_tensor(df['Signal'] if 'Signal' in df.columns else pd.Series(np.zeros(len(df)))),
@@ -222,8 +260,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'dates': pd.to_datetime(df.index) if not isinstance(df.index, pd.DatetimeIndex) else df.index
             }
 
+   
 
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, order_indices=None, options=None):
         """
         Reset all environments and return initial observations.
         @param seed: Optional seed for random number generation
@@ -242,7 +281,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         
         # Pick random batch of order indices using seeded random
         num_orders = len(self.orders_df)
-        order_indices = self._np_random.randint(0, num_orders, size=self.num_envs)
+        if order_indices is None:
+            order_indices = self._np_random.randint(0, num_orders, size=self.num_envs)
         
         self.order_idx = torch.tensor(order_indices, device=self.device)
         order_rows = self.orders_df.iloc[order_indices]
@@ -368,11 +408,10 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.total_cost.zero_()
         self.last_trade_step.fill_(-1)
         self.order_vwap.zero_()
-        self.cum_market_volume.zero_()
         self.cum_market_dollars.zero_()
+        self.arrival_price.zero_()
 
         # Compute arrival prices
-        self.arrival_price.zero_()
         for ticker in set(self.tickers):
             env_indices = [i for i, t in enumerate(self.tickers) if t == ticker]
             env_indices_tensor = torch.tensor(env_indices, device=self.device, dtype=torch.long)
@@ -395,9 +434,29 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 # Re-get indices after clamping
                 start_indices = self.global_start_indices[env_indices_tensor]
 
-            highs = self.data_arrays[ticker]['trade_high'][start_indices]
-            lows = self.data_arrays[ticker]['trade_low'][start_indices]
-            self.arrival_price[env_indices_tensor] = (highs + lows) / 2.0
+            bids   = self.data_arrays[ticker]['bid_price'][start_indices].to(self.device)
+            asks   = self.data_arrays[ticker]['ask_price'][start_indices].to(self.device)
+            highs  = self.data_arrays[ticker]['trade_high'][start_indices].to(self.device)
+            lows   = self.data_arrays[ticker]['trade_low'][start_indices].to(self.device)
+            vwaps  = self.data_arrays[ticker]['vwap'][start_indices].to(self.device)
+            lasts  = self.data_arrays[ticker]['trade_last'][start_indices].to(self.device)
+
+            has_prev = start_indices > 0
+            prev_indices = torch.where(has_prev, start_indices - 1, start_indices)
+
+            p_bids  = self.data_arrays[ticker]['bid_price'][prev_indices].to(self.device)
+            p_asks  = self.data_arrays[ticker]['ask_price'][prev_indices].to(self.device)
+            p_vwaps = self.data_arrays[ticker]['vwap'][prev_indices].to(self.device)
+            p_lasts = self.data_arrays[ticker]['trade_last'][prev_indices].to(self.device)
+            p_highs = self.data_arrays[ticker]['trade_high'][prev_indices].to(self.device)
+            p_lows  = self.data_arrays[ticker]['trade_low'][prev_indices].to(self.device)
+            
+            arrivals, reseed = get_robust_arrival(
+                bids, asks, highs, lows, vwaps, lasts,
+                p_bids, p_asks, p_highs, p_lows, p_vwaps, p_lasts,
+                has_prev
+            )
+            self.arrival_price[env_indices_tensor] = arrivals
 
         # Initialize first step values
         market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low', 'daily_volatility_lag1'], use_prior_step=False)
@@ -445,11 +504,12 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             torch.clamp(minute_pov, min=1e-6, max=POV_CAP),
             minute_pov
         )
-        epsilon = self.side * torch.sqrt(minute_pov_safe.clamp_min(0.0))
+        epsilon = self.side.float() * torch.sqrt(minute_pov_safe.clamp_min(0.0))
         # Deterministic immediate term is Y * ε_t
         deterministic_impact = self.env_impact_coef * epsilon  
         
         return deterministic_impact
+
 
     def _calculate_trade_sizes(self, current_volumes, action_values, mode='DPOV'):
         """
@@ -512,148 +572,170 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         return trade_sizes, povs_per_minute, action_pov
         
     
-    def _calculate_arrival_cost(self, trade_sizes, fill_prices):
+    def _reset_envs_where(self, done_mask_np):
         """
-        Calculates the trade cost for each environment.
-        This is the slippage cost of the trade, where slippage is defined as the difference between the 
-        fill price and the arrival price divided by the arrival price. The weight is the trade size divided 
-        by the order quantity. The cost is the side * weight * price_performance. Thus a negative cost 
-        is a profit.
+        Reset environments where the done mask is True.
 
         Args:
-            trade_sizes: Trade sizes for each environment
-            fill_prices: Fill prices for each environment
-
-        Returns:
-            Trade cost for each environment
+            done_mask_np: Numpy array of done masks
         """
-        # Sanity checks on order quantities and arrival prices
-        if torch.any(self.order_qty <= 0):
-            sample_idx = torch.nonzero(self.order_qty <= 0, as_tuple=False).view(-1)[:5].tolist()
-            logger.warning(f"order_qty had {int((self.order_qty <= 0).sum().item())} non-positive entries; divisions may be unstable. sample idx={sample_idx}")
+        # accept np.bool_ array or torch.bool tensor
+        if isinstance(done_mask_np, np.ndarray):
+            mask = torch.tensor(done_mask_np, device=self.device, dtype=torch.bool)
+        else:
+            mask = done_mask_np.to(self.device)
+
+        if not mask.any():
+            return
+
+        idx = torch.nonzero(mask, as_tuple=False).view(-1)
+        n = idx.numel()
+
+        # --- sample new orders for these slots ---
+        num_orders = len(self.orders_df)
+        new_indices = self._np_random.randint(0, num_orders, size=n)
+        self.order_idx[idx] = torch.tensor(new_indices, device=self.device)
+
+        order_rows = self.orders_df.iloc[new_indices]
+
+        if not isinstance(self.tickers, list) or len(self.tickers) != self.num_envs:
+            self.tickers = list(self.tickers) if isinstance(self.tickers, list) else [None] * self.num_envs
+            if len(self.tickers) < n:  # <-- this is the new line
+                self.tickers += [None] * (n - len(self.tickers))
         
-        if torch.any(~torch.isfinite(self.arrival_price)) or torch.any(self.arrival_price <= 0):
-            bad_arrival_mask = (~torch.isfinite(self.arrival_price)) | (self.arrival_price <= 0)
-            sample_idx = torch.nonzero(bad_arrival_mask, as_tuple=False).view(-1)[:5].tolist()
-            if 'arrival_error' not in self.logged_errors:
-                logger.warning(f"arrival_price had {int(bad_arrival_mask.sum().item())} invalid values; divisions may produce inf. sample idx={sample_idx}")
-                self.logged_errors['arrival_error'] = True
-        
-        weight = trade_sizes / self.order_qty.float()
-        price_performance = (fill_prices - self.arrival_price) / self.arrival_price
+        # Update only the done envs
+        for j, env_i in enumerate(idx.tolist()):
+            self.tickers[env_i] = order_rows['ticker'].iloc[j]
 
-        if torch.any(~torch.isfinite(price_performance)):
-            sample_idx = torch.nonzero(~torch.isfinite(price_performance), as_tuple=False).view(-1)[:5].tolist()
-            if 'price_performance_error' not in self.logged_errors:
-                logger.warning(f"price_performance produced non-finite values for {int((~torch.isfinite(price_performance)).sum().item())} envs; check arrival_price. sample idx={sample_idx}")
-                self.logged_errors['price_performance_error'] = True
-        
-        trade_cost = self.arrival_cost_weight * self.side * price_performance * weight
+        if 'date' in order_rows.columns:
+            if (getattr(self, 'order_dates', None) is None) or (len(self.order_dates) != self.num_envs):
+                self.order_dates = [None] * self.num_envs
+            for j, env_i in enumerate(idx.tolist()):
+                self.order_dates[env_i] = order_rows['date'].iloc[j]
 
-        return trade_cost
-        
-    def _calculate_vwap_cost(self, trade_sizes, fill_prices, current_market_volume, current_market_vwap):
-        """
-        Calculate the slippage of market VWAP to order VWAP per environment.
+        # Vectorized assign for tensors
+        self.order_qty[idx]   = torch.tensor(order_rows['order_qty'].values, device=self.device, dtype=torch.int64)
+        self.adv_pct[idx]     = torch.tensor(order_rows['adv_pct'].values, device=self.device, dtype=torch.float32)
+        self.ehv_pct[idx]     = torch.tensor(order_rows['ehv_pct'].values, device=self.device, dtype=torch.float32)
 
-        Outperformance yields negative cost; underperformance positive. Uses prior-step
-        market data (the bar in which the trade executed) and weights by the fraction
-        of the order executed in this step.
-        """
+        # adv column may be nested — reuse your robust extraction
+        adv_list = []
+        for x in order_rows['adv']:
+            if isinstance(x, pd.Series): adv_list.append(float(x.iloc[0]))
+            elif isinstance(x, (list, tuple, np.ndarray)): adv_list.append(float(x[0]))
+            else: adv_list.append(float(x))
+        self.adv[idx] = torch.tensor(adv_list, device=self.device, dtype=torch.float32)
 
-        # Update cumulative market VWAP components
-        self.cum_market_volume += current_market_volume
-        self.cum_market_dollars += current_market_volume * current_market_vwap
-        safe_cum_vol = torch.clamp(self.cum_market_volume, min=1.0)
-        market_ivwap = self.cum_market_dollars / safe_cum_vol
+        self.start_time[idx]   = torch.tensor(order_rows['start_time'].values, device=self.device, dtype=torch.int64)
+        self.end_time[idx]     = torch.tensor(order_rows['end_time'].values,   device=self.device, dtype=torch.int64)
+        self.time_horizon[idx] = torch.tensor(order_rows['time_horizon'].values, device=self.device, dtype=torch.int64)
+        self.side[idx]         = torch.tensor([1 if s.lower()=='buy' else -1 for s in order_rows['side']],
+                                          device=self.device, dtype=torch.int8)
 
-        # Order VWAP to-date; zero before first fill (cost will be zero if no trade this step)
-        order_vwap = self.order_vwap
+        # Per-order params (Y, tau) with your median fallbacks
+        if 'Y' in order_rows.columns:
+            Y_values = order_rows['Y'].values
+            bad = pd.isna(Y_values) | (Y_values < 0)
+            if bad.any():
+                valid = Y_values[~bad]
+                Y_values = np.where(bad, (np.median(valid) if len(valid)>0 else self.impact_coef.item()), Y_values)
+            self.env_impact_coef[idx] = torch.tensor(Y_values, device=self.device, dtype=torch.float32)
+        else:
+            self.env_impact_coef[idx] = self.impact_coef.expand(n)
 
-        # Step weight: fraction of order executed this step
-        weight = trade_sizes.float() / self.order_qty.clamp_min(1).float()
+        if 'tau' in order_rows.columns:
+            tau_values = order_rows['tau'].values
+            bad = pd.isna(tau_values) | (tau_values <= 0)
+            if bad.any():
+                valid = tau_values[~bad]
+                tau_values = np.where(bad, (np.median(valid) if len(valid)>0 else self.decay_rate.item()), tau_values)
+            self.env_decay_rate[idx] = torch.tensor(tau_values, device=self.device, dtype=torch.float32)
+        else:
+            self.env_decay_rate[idx] = self.decay_rate.expand(n)
 
-        # calculare vwap slippage, signed by side so outperformance is negative
-        vwap_slippage = (order_vwap - market_ivwap) / market_ivwap
-        vwap_cost = self.vwap_cost_weight * self.side * vwap_slippage * weight
+        # --- date to global_start_indices ---
+        if 'date' in order_rows.columns:
+            # Build per-slot global_start_indices like in reset(), but only for idx
+            gsi = torch.empty(n, device=self.device, dtype=torch.int64)
+            for j, env in enumerate(idx.tolist()):
+                ticker = self.tickers[env]
+                date = pd.to_datetime(order_rows['date'].iloc[j])
+                tdates = self.data_arrays[ticker]['dates']
+                # Ensure pandas DatetimeIndex
+                if isinstance(tdates, pd.DatetimeIndex):
+                    nd = tdates.normalize()
+                else:
+                    nd = pd.DatetimeIndex(pd.to_datetime(tdates)).normalize()
+                dd = pd.Timestamp(date).normalize()
+                mask = (nd == dd)
+                mask_np = mask.to_numpy() if hasattr(mask, "to_numpy") else np.asarray(mask)
+                where = np.where(mask_np)[0]
+                if len(where) == 0:
+                    diffs = (nd - dd).abs()                 # TimedeltaIndex
+                    nearest_idx = int(diffs.argmin())
+                    # convert to days robustly
+                    delta_days = getattr(diffs[nearest_idx], "days",
+                         float(diffs[nearest_idx] / np.timedelta64(1, "D")))
+                    if delta_days <= 3:
+                        base = nearest_idx
+                    else:
+                        raise ValueError(f"No data within 3 days for {ticker} near {dd.date()}")
+                else:
+                    base = where[0]
+                gsi[j] = base + self.start_time[env]
+            self.global_start_indices[idx] = gsi
+        else:
+            self.global_start_indices[idx] = self.start_time[idx]
 
-        # Zero cost when no trade executed this step
-        vwap_cost = torch.where(trade_sizes > 0, vwap_cost, torch.zeros_like(vwap_cost))
+        # --- recompute robust arrival for these slots only ---
+        # gather per-ticker in batches; quick path: loop over unique tickers in idx
+        for ticker in set(self.tickers[k] for k in idx.tolist()):
+            envs = [k for k in idx.tolist() if self.tickers[k] == ticker]
+            env_t = torch.tensor(envs, device=self.device, dtype=torch.long)
+            sidx  = self.global_start_indices[env_t]
+            max_len = len(self.data_arrays[ticker]['trade_high'])
+            sidx = torch.clamp(sidx, 0, max_len - 1)
 
-        return vwap_cost
-        
-    def _calculate_rate_penalty(self, current_volumes, sigma_step):
-        """
-        Calculates the rate penalty for each environment.
+            has_prev = sidx > 0
+            pidx = torch.where(has_prev, sidx - 1, sidx)
 
-        Args:
-            current_volumes: Current volumes for each environment
-            sigma_step: Step size for the volatility
+            bids   = self.data_arrays[ticker]['bid_price'][sidx].to(self.device)
+            asks   = self.data_arrays[ticker]['ask_price'][sidx].to(self.device)
+            highs  = self.data_arrays[ticker]['trade_high'][sidx].to(self.device)
+            lows   = self.data_arrays[ticker]['trade_low'][sidx].to(self.device)
+            vwaps  = self.data_arrays[ticker]['vwap'][sidx].to(self.device)
+            lasts  = self.data_arrays[ticker]['trade_last'][sidx].to(self.device)
 
-        Returns:
-            Rate penalty for each environment
-        """
-        # sanity check on time horizon
-        if torch.any(self.time_horizon <= 0):
-            sample_idx = torch.nonzero(self.time_horizon <= 0, as_tuple=False).view(-1)[:5].tolist()
-            if 'time_horizon_error' not in self.logged_errors:
-                logger.warning(f"time_horizon had {int((self.time_horizon <= 0).sum().item())} non-positive entries; clipping to 1. sample idx={sample_idx}")
-                self.logged_errors['time_horizon_error'] = True
-        time_horizon_safe = self.time_horizon.clamp_min(1).float()
-        
-        # target completion ratio = 
-        # traded_volume[order start, now]/(traded_volume[order start, now]+expected_volume[now+1,H])
-        volume_traded = current_volumes[self.start_time:self.current_step].sum()
-        # TODO: this needs to be modified if a volume profile exists
-        expected_volume = self.adv * (time_horizon_safe - self.current_step).float()/MINUTES_PER_DAY
-        target_completion_ratio = volume_traded / torch.clamp(volume_traded + expected_volume, min=1.0)
-        target_completion_ratio = torch.clamp(target_completion_ratio, min=0.0, max=1.0)
-        
-        actual_completion_ratio = (self.order_qty - self.shares_remaining).float() / self.order_qty.float()
-        rate_deviation = actual_completion_ratio - target_completion_ratio
-        # Penalize deviation using a minutely volatility scale
-        rate_penalty = sigma_step * torch.abs(rate_deviation)
+            p_bids  = self.data_arrays[ticker]['bid_price'][pidx].to(self.device)
+            p_asks  = self.data_arrays[ticker]['ask_price'][pidx].to(self.device)
+            p_highs = self.data_arrays[ticker]['trade_high'][pidx].to(self.device)
+            p_lows  = self.data_arrays[ticker]['trade_low'][pidx].to(self.device)
+            p_vwaps = self.data_arrays[ticker]['vwap'][pidx].to(self.device)
+            p_lasts = self.data_arrays[ticker]['trade_last'][pidx].to(self.device)
 
-        return rate_penalty
+            arrivals, _ = get_robust_arrival(
+                bids, asks, highs, lows, vwaps, lasts,
+                p_bids, p_asks, p_highs, p_lows, p_vwaps, p_lasts,
+                has_prev=has_prev
+            )
+            self.arrival_price[env_t] = arrivals
+
+        # --- zero per-episode state for those slots ---
+        self.current_step[idx]        = 0
+        self.shares_remaining[idx]    = self.order_qty[idx]
+        self.accumulated_impact[idx]  = 0.0
+        self.immediate_impact[idx]    = 0.0
+        self.order_vwap[idx]          = 0.0
+        self.last_fill_price[idx]     = 0.0
+        self.last_trade_size[idx]     = 0
+        self.last_action_fraction[idx]= 0.0
+        self.last_trade_step[idx]     = -1
+        self.total_market_volume[idx] = 0.0
+        self.cum_market_dollars[idx]  = 0.0
+        self.total_cost[idx]          = 0.0
+        self.done[idx]                = False
+
     
-    def _calculate_unfilled_cost(self, trade_sizes, daily_sigma):
-        """
-        Calculates the unfilled cost for each environment.
-
-        Args:
-            trade_sizes: Trade sizes for each environment
-            daily_sigma: Daily volatility for each environment
-
-        Returns:
-            Unfilled cost for each environment
-        """
-        unfilled_cost = torch.zeros_like(trade_cost)
-        # use daily volatility as a proxy for overnight holding cost
-        # TODO: ideally this is close to open vol (or a true trading cost)
-        if truncated_mask.any():
-            unfilled_ratio = self.shares_remaining[truncated_mask].float() / self.order_qty[truncated_mask]
-            unfilled_cost[truncated_mask] = daily_sigma[truncated_mask] * unfilled_ratio
-
-        return self.unfilled_cost_weight * unfilled_cost 
-
-        
-    def _calculate_holding_risk_cost(self, sigma_step):
-        """
-        Calculates the holding risk cost for each environment.
-
-        Args:
-            sigma_step: Step size for the volatility
-
-        Returns:
-            Holding risk cost for each environment
-        """
-        # holding risk penalty
-        holding_risk_cost = self.risk_lambda * sigma_step * (self.shares_remaining.float() 
-                    / self.order_qty.clamp_min(1).float()).abs()
-
-        return self.holding_risk_weight * holding_risk_cost
-
-
     def step_wait(self):
         """
         Execute the stored actions and return results.
@@ -664,10 +746,11 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             raise ValueError(f"Invalid actions {self.actions}. Must be between 0 and {len(self.action_values)-1}")
 
         # Get current market data
-        market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low', 'daily_volatility_lag1'], use_prior_step=False)
+        market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low', 'bid_price',
+                         'ask_price', 'daily_volatility_lag1'], use_prior_step=False)
         current_volumes = market_data['trade_volume']
         vwap_prices = market_data['vwap']
-        mid_prices = (market_data['trade_high'] + market_data['trade_low']) * 0.5
+        mid_prices = (market_data['bid_price'] + market_data['ask_price']) * 0.5
         # Clamp daily_sigma to be non-negative and log anomalies
         raw_daily_sigma = market_data['daily_volatility_lag1']
         bad_sigma_mask = (~torch.isfinite(raw_daily_sigma)) | (raw_daily_sigma < 0)
@@ -697,9 +780,6 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Update market and order cumulative stats for VWAP and completion
         self.total_market_volume += current_volumes + trade_sizes.float()
         self.total_market_volume = torch.clamp(self.total_market_volume, min=1)
-        # Cumulative market IVWAP
-        self.cum_market_volume += current_volumes
-        self.cum_market_dollars += current_volumes * vwap_prices
 
         # Compute impacts using environment-specific parameters
         immediate_impact_per_minute = self._calculate_deterministic_impact(povs_per_minute)
@@ -750,6 +830,9 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         )
         self.order_vwap = torch.where(trade_mask, new_order_vwap, self.order_vwap)
 
+        # Cumulative market IVWAP
+        self.cum_market_dollars += current_volumes * vwap_prices + trade_sizes.float() * fill_prices
+
         # Update state
         prev_shares = self.shares_remaining.clone()
         self.shares_remaining = torch.max(prev_shares - trade_sizes, torch.zeros_like(prev_shares))
@@ -769,8 +852,10 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Compute rewards
         terminated_mask = self.shares_remaining <= 0
         truncated_mask = self.current_step >= self.time_horizon
-        
+    
         reward = torch.zeros(self.num_envs, device=self.device)
+
+        should_log = bool(((self.current_step % 100) == 0).any().item()) and False
 
         # Compute costs either via pluggable cost model or legacy helpers
         if self.cost_model is not None:
@@ -786,31 +871,32 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 adv=self.adv,
                 time_horizon=self.time_horizon,
                 current_step=self.current_step,
-                cum_market_volume=self.cum_market_volume,
-                cum_market_dollars=self.cum_market_dollars
+                cum_market_volume=self.total_market_volume,
+                cum_market_dollars=self.cum_market_dollars,
+                truncated_mask=truncated_mask
             )
             arrival_cost = components['arrival_cost']
             vwap_cost = components['vwap_cost']
             rate_devitation_penalty = components['rate_penalty']
-            hoding_cost = components['holding_risk_cost']
+            holding_risk_cost = components['holding_risk_cost']
             unfilled_cost = components['unfilled_cost']
+            
+            # TEMP debug
+            if should_log:
+                # Get the first environment's step that triggered logging
+                log_mask = (self.current_step % 100) == 0
+                current_step = self.current_step[log_mask][0].item() if log_mask.any() else self.current_step[0].item()
+                logger.info(f"1:{current_step} arrival={float(arrival_cost.mean())}, vwap={float(vwap_cost.mean())}, rate={float(rate_devitation_penalty.mean())}, holding={float(holding_risk_cost.mean())}, unfilled={float(unfilled_cost.mean())}")
+        
         else:
-            arrival_cost = self._calculate_arrival_cost(trade_sizes, fill_prices)
-            # Legacy rate penalty
-            rate_devitation_penalty = self._calculate_rate_penalty(current_volumes, sigma_step)
-            vwap_cost = self._calculate_vwap_cost(
-                trade_sizes,
-                fill_prices,
-                current_market_volume=current_volumes,
-                current_market_vwap=vwap_prices,
-            )
-            hoding_cost = self._calculate_holding_risk_cost(sigma_step)
-            # Fallback unfilled cost (zeros for now)
-            unfilled_cost = torch.zeros_like(arrival_cost)
-
-            total_step_cost = arrival_cost + vwap_cost + rate_devitation_penalty + hoding_cost + unfilled_cost
+            logger.error("No cost model provided, cannot compute costs")
 
         reward = -total_step_cost
+        
+        # TEMP debug
+        if should_log:
+            logger.info(f"2: reward={float(reward.mean())} arrival={float(arrival_cost.mean())}, vwap={float(vwap_cost.mean())}, rate={float(rate_devitation_penalty.mean())}, holding={float(holding_risk_cost.mean())}, unfilled={float(unfilled_cost.mean())}")
+        
         # Guard against non-finite rewards propagating into training, with logging
         if torch.any(~torch.isfinite(reward)):
             sample_idx = torch.nonzero(~torch.isfinite(reward), as_tuple=False).view(-1)[:5].tolist()
@@ -818,8 +904,18 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 logger.warning(f"Non-finite rewards detected for {int((~torch.isfinite(reward)).sum().item())} envs; converting to 0. sample idx={sample_idx}")
                 self.logged_errors['reward_error'] = True
         reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # TEMP debug
+        if should_log:
+            logger.info(f"3: reward: {float(reward.mean())}")
+
+        if not hasattr(self, "total_cost") or self.total_cost.shape != total_step_cost.shape:
+            self.total_cost = torch.zeros_like(total_step_cost)
+        self.total_cost += torch.nan_to_num(total_step_cost.detach())
         
-        self.total_cost = getattr(self, "total_cost", 0.0) + total_step_cost.detach().sum()
+        # TEMP debug
+        if should_log:
+            logger.info(f"4: total_cost: {float(self.total_cost.mean())}")
 
         # Update done flags (keep episodes running until time horizon for plotting)
         self.done = truncated_mask
@@ -831,10 +927,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             idx = np.where(~np.isfinite(obs))[0]
             raise RuntimeError(f"step_asynch:Env returned non-finite features at idx={idx},values={obs[idx]}")
         
-        # Convert to numpy for VecEnv interface
-        # Note: This is not strictly necessary, but keeps interface consistent
-        obs_np = obs
         rewards_np = reward.cpu().numpy()
+        
         # Validate rewards are finite
         if not np.isfinite(rewards_np).all():
             raise RuntimeError(f"step_wait: non-finite rewards detected: {rewards_np[~np.isfinite(rewards_np)]}")
@@ -854,10 +948,44 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'vwap_cost': float(vwap_cost[i].item()),
                 'rate_penalty': float(rate_devitation_penalty[i].item()),
                 'unfilled_cost': float(unfilled_cost[i].item()),
-                'holding_risk_cost': float(hoding_cost[i].item()),
+                'holding_risk_cost': float(holding_risk_cost[i].item()),
                 'total_step_cost': float(total_step_cost[i].item()),
                 'step_reward': float(reward[i].item()),
             })
+
+
+        # nasty hack section to handle SB3 
+
+        done_mask = truncated_mask | (self.shares_remaining <= 0)
+        self.done = done_mask
+
+        # Build obs *before* reset so we can stash terminal_observation
+        obs = self._get_observation()
+
+        dones_np = self.done.detach().cpu().numpy()
+        if dones_np.any():
+            # 1) attach terminal obs (SB3 reads this for logging)
+            done_ids = np.where(dones_np)[0]
+            for i in done_ids:
+                if not isinstance(infos[i], dict):
+                    infos[i] = {}
+                infos[i]["terminal_observation"] = obs[i].copy()
+
+            # 2) reset only those env slots (sample new orders, reinit state, recompute arrival)
+            self._reset_envs_where(dones_np)
+
+            # 3) fetch fresh obs for those slots and splice them into the outgoing batch
+            obs_fresh = self._get_observation()
+            obs[dones_np] = obs_fresh[dones_np]
+
+
+        # TEMP debug
+        if should_log:
+            logger.info(f"5: rewards_np: {np.mean(rewards_np)}, pct of zeros: {np.sum(rewards_np == 0)/len(rewards_np)}, pct of nan: {np.sum(np.isnan(rewards_np))/len(rewards_np)}")
+
+        
+        obs_np = obs
+        dones_np = self.done.detach().cpu().numpy()
 
         return obs_np, rewards_np, dones_np, infos
 
@@ -933,6 +1061,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
 
         return obs_tensor.cpu().numpy()
 
+
     def render(self, mode='human'):
         """Render the environment (simplified for vectorized version)."""
         if mode == 'human':
@@ -944,26 +1073,6 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         Close the environment.
         """
         pass
-
-    def seed(self, seed=None):
-        """
-        Set the seed for the environment.
-        @param seed: Seed value to set (optional)
-        
-        WARNING: This method is deprecated. Use env.reset(seed=seed) instead.
-        """
-        import warnings
-        warnings.warn(
-            "The 'seed' method is deprecated. Use 'env.reset(seed=seed)' instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        
-        if seed is not None:
-            self._seed = seed
-            self._set_seed(seed)
-            self._np_random = np.random.RandomState(seed)
-        return [seed] * self.num_envs
 
 
     def generate_random_order_indices(self, num_episodes):
@@ -1039,7 +1148,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
     
         # Reset all environments with the batch orders
         self.order_idx = torch.tensor(full_indices, device=self.device)
-        obs = self.reset()
+        obs = self.reset(order_indices=full_indices)
     
         if collect_step_info:
             # Pre-allocate tensors for efficiency
@@ -1077,378 +1186,108 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                     'date': str(self.order_dates[i]) if self.order_dates else None,
                 })
         
-        step_counts = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+            step_counts = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
     
-    # Track which environments are done
-    done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-    step = 0
+        # Track which environments are done
+        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        step = 0
     
-    while not done[:batch_size].all():
-        # Get actions for all active environments
-        actions = np.zeros(self.num_envs, dtype=np.int32)
-        for i in range(self.num_envs):
-            if not done[i]:
-                if hasattr(model, 'predict'):
-                    action, _ = model.predict(obs[i], deterministic=False)
-                else:
-                    action, _ = model.predict(obs[i])
+        while not done[:batch_size].all():
+            # Get actions for all active environments
+            actions = np.zeros(self.num_envs, dtype=np.int32)
+            for i in range(self.num_envs):
+                if not done[i]:
+                    if hasattr(model, 'predict'):
+                        action, _ = model.predict(obs[i], deterministic=False)
+                    else:
+                        action, _ = model.predict(obs[i])
                 actions[i] = action
         
-        # Step all environments
-        self.step_async(actions)
-        obs, rewards, dones, infos = self.step_wait()
+            # Step all environments
+            self.step_async(actions)
+            obs, rewards, dones, infos = self.step_wait()
         
-        if collect_step_info and step < max_horizon:
-            # Get market data once for all environments
-            market_data = self._get_market_data_batch(
-                ['trade_volume', 'vwap', 'trade_high', 'trade_low'],
-                use_prior_step=True
-            )
+            if collect_step_info and step < max_horizon:
+                # Get market data once for all environments
+                market_data = self._get_market_data_batch(
+                    ['trade_volume', 'vwap', 'trade_high', 'trade_low'],
+                    use_prior_step=True
+                )
             
-            # Store data for active environments in this batch
-            active_mask = ~done[:batch_size] 
+                # Store data for active environments in this batch
+                active_mask = ~done[:batch_size] 
+                for i in range(batch_size):
+                    if active_mask[i]:
+                        step_data['shares_remaining'][i, step] = self.shares_remaining[i]
+                        step_data['last_fill_price'][i, step] = self.last_fill_price[i]
+                        step_data['last_trade_size'][i, step] = self.last_trade_size[i]
+                        step_data['immediate_impact'][i, step] = self.immediate_impact[i]
+                        step_data['accumulated_impact'][i, step] = self.accumulated_impact[i]
+                        step_data['order_vwap'][i, step] = self.order_vwap[i]
+                        step_data['action_percentage'][i, step] = self.last_action_fraction[i]
+                        step_data['mid_price'][i, step] = (market_data['trade_high'][i] + market_data['trade_low'][i]) * 0.5
+                        step_data['vwap_price'][i, step] = market_data['vwap'][i]
+                        step_data['current_trade_volume'][i, step] = market_data['trade_volume'][i]
+                        step_counts[i] = step + 1
+        
+            done = torch.tensor(dones, device=self.device, dtype=torch.bool)
+            step += 1
+    
+        # Convert tensor data to list format for compatibility
+        batch_orders = []
+    
+        if collect_step_info:
             for i in range(batch_size):
-                if active_mask[i]:
-                    step_data['shares_remaining'][i, step] = self.shares_remaining[i]
-                    step_data['last_fill_price'][i, step] = self.last_fill_price[i]
-                    step_data['last_trade_size'][i, step] = self.last_trade_size[i]
-                    step_data['immediate_impact'][i, step] = self.immediate_impact[i]
-                    step_data['accumulated_impact'][i, step] = self.accumulated_impact[i]
-                    step_data['order_vwap'][i, step] = self.order_vwap[i]
-                    step_data['action_percentage'][i, step] = self.last_action_fraction[i]
-                    step_data['mid_price'][i, step] = (market_data['trade_high'][i] + market_data['trade_low'][i]) * 0.5
-                    step_data['vwap_price'][i, step] = market_data['vwap'][i]
-                    step_data['current_trade_volume'][i, step] = market_data['trade_volume'][i]
-                    step_counts[i] = step + 1
-        
-        done = torch.tensor(dones, device=self.device, dtype=torch.bool)
-        step += 1
-    
-    # Convert tensor data to list format for compatibility
-    batch_orders = []
-    
-    if collect_step_info:
-        for i in range(batch_size):
-            order_info = []
-            num_steps = step_counts[i].item()
+                order_info = []
+                num_steps = step_counts[i].item()
             
-            for s in range(num_steps):
-                info = order_constants[i].copy()
-                info.update({
-                    'current_step': s,
-                    'episode': batch_indices[i],
-                    'shares_remaining': step_data['shares_remaining'][i, s].item(),
-                    'last_fill_price': step_data['last_fill_price'][i, s].item(),
-                    'last_trade_size': step_data['last_trade_size'][i, s].item(),
-                    'immediate_impact': step_data['immediate_impact'][i, s].item(),
-                    'accumulated_impact': step_data['accumulated_impact'][i, s].item(),
-                    'order_vwap': step_data['order_vwap'][i, s].item(),
-                    'action_percentage': step_data['action_percentage'][i, s].item(),
-                    'mid_price': step_data['mid_price'][i, s].item(),
-                    'vwap_price': step_data['vwap_price'][i, s].item(),
-                    'current_trade_volume': step_data['current_trade_volume'][i, s].item(),
-                    'total_cost': self.total_cost[i].item(),
-                })
-                order_info.append(info)
-            
-            batch_orders.append(order_info)
-    else:
-        # Just return empty lists if not collecting step info
-        batch_orders = [[] for _ in range(batch_size)]
-    
-    return batch_orders
-
-
-
-    def execute_orders(self, model, num_episodes=10, fixed_order_indices=None, collect_step_info=False):
-        """
-        Execute orders using the provided model (maintains same interface as original).
-        @param model: The trained RL model to use for action selection.
-        @param num_episodes: Number of orders to execute in this run.
-        @param fixed_order_indices: Optional list of specific order indices to use for consistent comparison.
-                                  If None, random orders will be selected. If provided, num_episodes will be
-                                  set to len(fixed_order_indices).
-        @param collect_step_info: If True, collect per-step info dicts (slower). If False, only per-episode.
-        @return: Tuple of (orders_list, order_indices_used) where orders_list contains execution results
-                and order_indices_used contains the actual order indices that were executed.
-        """
-        orders = []
-        
-        # If fixed indices provided, use them; otherwise generate new ones
-        if fixed_order_indices is not None:
-            num_episodes = len(fixed_order_indices)
-            order_indices_used = fixed_order_indices.copy()
-        else:
-            # Generate random order indices once and reuse them
-            num_orders = len(self.orders_df)
-            if not hasattr(self, '_np_random') or self._np_random is None:
-                self._np_random = np.random.RandomState(self._seed)
-            order_indices_used = self._np_random.choice(num_orders, size=num_episodes, replace=False).tolist()
-        
-        for ep in range(num_episodes):
-            # Use specific order index for this episode
-            obs = self._reset_with_order_index(order_indices_used[ep])
-            done = np.zeros(self.num_envs, dtype=bool)
-            episode_data = []
-            
-            # For compatibility, we'll track the first environment
-            env_idx = 0
-            order_info = []
-            
-            step = 0
-            while not done[env_idx]:
-                # Get action from model (for first environment)
-                if hasattr(model, 'predict'):
-                    action, _ = model.predict(obs[env_idx], deterministic=False)
-                else:
-                    # For baseline strategies
-                    action, _ = model.predict(obs[env_idx])
-                
-                # Create actions for all environments (use same action for simplicity)
-                actions = np.full(self.num_envs, action)
-                
-                # Step the vectorized environment
-                self.step_async(actions)
-                obs, rewards, dones, infos = self.step_wait()
-                
-                if collect_step_info:
-                    # Get market data for the bin in which the trade executed (prior step after step_wait)
-                    market_data = self._get_market_data_batch(['trade_volume', 'vwap', 'trade_high', 'trade_low'], use_prior_step=True)
-                    current_trade_volume = market_data['trade_volume'][env_idx].item()
-                    vwap_price = market_data['vwap'][env_idx].item()
-                    mid_price = ((market_data['trade_high'][env_idx] + market_data['trade_low'][env_idx]) * 0.5).item()
-                    
-                    # Track info for first environment (for compatibility)
-                    info = {
-                        'order_idx': self.order_idx[env_idx].item(),
-                        'ticker': self.tickers[env_idx],
-                        'order_qty': self.order_qty[env_idx].item(),
-                        'adv_pct': self.adv_pct[env_idx].item(),
-                        'ehv_pct': self.ehv_pct[env_idx].item(),
-                        'start_time': self.start_time[env_idx].item(),
-                        'end_time': self.end_time[env_idx].item(),
-                        'time_horizon': self.time_horizon[env_idx].item(),
-                        'side': 'buy' if self.side[env_idx].item() == 1 else 'sell',
-                        'shares_remaining': self.shares_remaining[env_idx].item(),
-                        'last_fill_price': self.last_fill_price[env_idx].item(),
-                        'last_trade_size': self.last_trade_size[env_idx].item(),
-                        'immediate_impact': self.immediate_impact[env_idx].item(),
-                        'accumulated_impact': self.accumulated_impact[env_idx].item(),
-                        'arrival_price': self.arrival_price[env_idx].item(),
-                        'order_vwap': self.order_vwap[env_idx].item(),
-                        'total_cost': self.total_cost[env_idx].item(),
-                        'action_percentage': float(self.last_action_fraction[env_idx].item()),
-                        'adv': self.adv[env_idx].item(),
-                        'current_step': step,
-                        'episode': ep,
-                        # Add missing fields required by plotting functions
-                        'mid_price': mid_price,
-                        'vwap_price': vwap_price,
-                        'current_trade_volume': current_trade_volume
-                    }
-                    
-                    if self.order_dates:
-                        info['date'] = str(self.order_dates[env_idx])
-                    
+                for s in range(num_steps):
+                    info = order_constants[i].copy()
+                    info.update({
+                        'current_step': s,
+                        'episode': batch_indices[i],
+                        'shares_remaining': step_data['shares_remaining'][i, s].item(),
+                        'last_fill_price': step_data['last_fill_price'][i, s].item(),
+                        'last_trade_size': step_data['last_trade_size'][i, s].item(),
+                        'immediate_impact': step_data['immediate_impact'][i, s].item(),
+                        'accumulated_impact': step_data['accumulated_impact'][i, s].item(),
+                        'order_vwap': step_data['order_vwap'][i, s].item(),
+                        'action_percentage': step_data['action_percentage'][i, s].item(),
+                        'mid_price': step_data['mid_price'][i, s].item(),
+                        'vwap_price': step_data['vwap_price'][i, s].item(),
+                        'current_trade_volume': step_data['current_trade_volume'][i, s].item(),
+                        'total_cost': self.total_cost[i].item(),
+                    })
                     order_info.append(info)
-                
-                done = dones
-                step += 1
             
-            orders.append(order_info)
-        
-        return orders, order_indices_used
+                batch_orders.append(order_info)
+        else:
+            # Just return empty lists if not collecting step info
+            batch_orders = [[] for _ in range(batch_size)]
+    
+        return batch_orders
 
-    def _reset_with_order_index(self, order_idx):
+    def execute_orders(self, model, num_episodes=10, fixed_order_indices=None, collect_step_info=True):
         """
-        Reset environment with a specific order index.
+        Backward compatibility wrapper that maintains original interface.
+    
         Args:
-            order_idx: The index of the order to reset the environment to.
+            model: The trained RL model
+            num_episodes: Number of orders to execute (ignored if fixed_order_indices provided)
+            fixed_order_indices: Optional list of specific order indices
+            collect_step_info: If True, collect per-step info
+    
         Returns:
-            The initial observation of the environment.
+            Tuple of (orders_list, order_indices_used)
         """
-        # Initialize _np_random if not already done
-        if not hasattr(self, '_np_random') or self._np_random is None:
-            self._np_random = np.random.RandomState(self._seed)
-        
-        # Validate order_idx
-        if order_idx < 0 or order_idx >= len(self.orders_df):
-            raise ValueError(f"order_idx {order_idx} out of range [0, {len(self.orders_df)})")
-        
-        # Use the specified order index for the first environment, random for others
-        order_indices = [order_idx] + self._np_random.randint(
-            0, len(self.orders_df), size=self.num_envs-1).tolist()
-        
-        self.order_idx = torch.tensor(order_indices, device=self.device)
-        order_rows = self.orders_df.iloc[order_indices]
-
-        # Validate that we got valid data
-        if order_rows.empty:
-            raise ValueError(f"No order data found for indices {order_indices}")
-
-        # Extract order details for the batch with validation
-        self.tickers = order_rows['ticker'].tolist()
-        if all(t is None for t in self.tickers):
-            raise ValueError("All tickers are None - check orders_df data")
-            
-        self.order_qty = torch.tensor(order_rows['order_qty'].values, device=self.device, dtype=torch.int64)
-        if torch.all(self.order_qty == 0):
-            raise ValueError("All order quantities are 0 - check orders_df data")
-            
-        self.adv_pct = torch.tensor(order_rows['adv_pct'].values, device=self.device, dtype=torch.float32)
-        self.ehv_pct = torch.tensor(order_rows['ehv_pct'].values, device=self.device, dtype=torch.float32)
-        
-        # Extract adv values robustly
-        adv_list = []
-        for x in order_rows['adv']:
-            if isinstance(x, pd.Series):
-                adv_list.append(float(x.iloc[0]))
-            elif isinstance(x, (list, tuple, np.ndarray)):
-                adv_list.append(float(x[0]))
-            else:
-                adv_list.append(float(x))
-        self.adv = torch.tensor(adv_list, device=self.device, dtype=torch.float32)
-        
-        self.start_time = torch.tensor(order_rows['start_time'].values, device=self.device, dtype=torch.int64)
-        self.end_time = torch.tensor(order_rows['end_time'].values, device=self.device, dtype=torch.int64)
-        self.time_horizon = torch.tensor(order_rows['time_horizon'].values, device=self.device, dtype=torch.int64)
-        self.side = torch.tensor([1 if s.lower() == 'buy' else -1 for s in order_rows['side']], 
-                                device=self.device, dtype=torch.int8)
-
-        # Set environment-specific impact parameters from orders_df or use defaults
-        if 'Y' in order_rows.columns:
-            Y_values = order_rows['Y'].values
-            # Check for NaN values and replace with median
-            nan_mask = pd.isna(Y_values)
-            if nan_mask.any():
-                valid_values = Y_values[~nan_mask]
-                if len(valid_values) > 0:
-                    median_value = np.median(valid_values)
-                    if 'Y_error' in self.logged_errors:
-                        logger.warning(f"Found {nan_mask.sum()} NaN Y values, replacing with median {median_value}")
-                        self.logged_errors['Y_error'] = True
-                    Y_values = np.where(nan_mask, median_value, Y_values)
-                else:
-                    logger.warning(f"All Y values are NaN, using default {self.impact_coef.item()}")
-                    Y_values = np.full_like(Y_values, self.impact_coef.item())
-            self.env_impact_coef = torch.tensor(Y_values, device=self.device, dtype=torch.float32)
+        if fixed_order_indices is not None:
+            order_indices = fixed_order_indices
         else:
-            # Use default impact coefficient for all environments
-            self.env_impact_coef = self.impact_coef.expand(self.num_envs)
-            
-        if 'tau' in order_rows.columns:
-            tau_values = order_rows['tau'].values
-            # Check for NaN values and replace with median
-            nan_mask = pd.isna(tau_values)
-            if nan_mask.any():
-                valid_values = tau_values[~nan_mask]
-                if len(valid_values) > 0:
-                    median_value = np.median(valid_values)
-                    logger.warning(f"Found {nan_mask.sum()} NaN tau values, replacing with median {median_value}")
-                    tau_values = np.where(nan_mask, median_value, tau_values)
-                else:
-                    logger.warning(f"All tau values are NaN, using default {self.decay_rate.item()}")
-                    tau_values = np.full_like(tau_values, self.decay_rate.item())
-            self.env_decay_rate = torch.tensor(tau_values, device=self.device, dtype=torch.float32)
-        else:
-            # Use default decay rate for all environments
-            self.env_decay_rate = self.decay_rate.expand(self.num_envs)
+            order_indices = self.generate_random_order_indices(num_episodes)
+    
+        orders = self.execute_orders_vectorized(model, order_indices, collect_step_info)
+        return orders, order_indices
 
-        # Handle dates for global indexing
-        if 'date' in order_rows.columns:
-            self.order_dates = order_rows['date'].tolist()
-            self.global_start_indices = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
-            
-            for i, (ticker, date) in enumerate(zip(self.tickers, self.order_dates)):
-                ticker_dates = self.data_arrays[ticker]['dates']
-                
-                if isinstance(date, str):
-                    order_date = pd.to_datetime(date)
-                else:
-                    order_date = pd.to_datetime(date)
-                
-                # Normalize times for date-only comparison
-                normalized_ticker_dates = ticker_dates.normalize()
-                normalized_order_date = pd.Timestamp(order_date).normalize()
-                
-                # Find matching date
-                date_mask = normalized_ticker_dates == normalized_order_date
-                date_indices = np.where(date_mask)[0]
-                
-                if len(date_indices) == 0:
-                    # Try finding the nearest date
-                    date_diffs = abs(normalized_ticker_dates - normalized_order_date)
-                    nearest_idx = date_diffs.argmin()
-                    
-                    # Check if nearest date is within acceptable range
-                    if date_diffs.iloc[nearest_idx].days <= 3:
-                        date_indices = np.array([nearest_idx])
-                        logger.warning(f"No exact match for {ticker} on {order_date.date()}, "
-                                     f"using nearest date: {ticker_dates[nearest_idx].date()}")
-                    else:
-                        raise ValueError(f"No data found for ticker {ticker} within 3 days of {order_date.date()}")
-                
-                self.global_start_indices[i] = date_indices[0] + self.start_time[i]
-        else:
-            self.order_dates = None
-            self.global_start_indices = self.start_time.clone()
-
-        # Reset state variables (but keep order data we just set)
-        self.current_step = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
-        self.shares_remaining = self.order_qty.clone()  # Start with full order quantity
-        self.accumulated_impact = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        
-        # Trading state
-        self.immediate_impact = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.order_vwap = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.last_fill_price = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.last_trade_size = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
-        self.last_action_fraction = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.last_trade_step = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.int32)
-        self.total_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.total_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.cum_market_volume = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.cum_market_dollars = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        
-        # Compute arrival prices
-        self.arrival_price.zero_()
-        for ticker in set(self.tickers):
-            if ticker is None or ticker not in self.data_arrays:
-                continue
-                
-            env_indices = [i for i, t in enumerate(self.tickers) if t == ticker]
-            if not env_indices:
-                continue
-                
-            env_indices_tensor = torch.tensor(env_indices, device=self.device, dtype=torch.long)
-            start_indices = self.global_start_indices[env_indices_tensor]
-            
-            # Data validation
-            max_len = len(self.data_arrays[ticker]['trade_high'])
-            valid_indices = torch.clamp(start_indices, 0, max_len - 1)
-            
-            highs = self.data_arrays[ticker]['trade_high'][valid_indices]
-            lows = self.data_arrays[ticker]['trade_low'][valid_indices]
-            self.arrival_price[env_indices_tensor] = (highs + lows) / 2.0
-        
-        # Return initial observation
-        return self._get_observation()
-
-    def execute_fixed_orders(self, model, order_indices, return_indices=False):
-        """
-        Execute specific orders by their indices to ensure consistent evaluation across models.
-        
-        @param model: The trained RL model to use for action selection.
-        @param order_indices: List of specific order indices to execute.
-        @param return_indices: If True, return the order indices used (for compatibility).
-        @return: List of order information dictionaries or tuple (orders, indices) if return_indices=True.
-        """
-        orders, used_indices = self.execute_orders(model, fixed_order_indices=order_indices)
-        
-        if return_indices:
-            return orders, used_indices
-        return orders
 
     # Required VecEnv abstract methods
     def env_is_wrapped(self, wrapper_class, indices=None):

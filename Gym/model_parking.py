@@ -3,12 +3,13 @@ import logging
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import CallbackList
+from stable_baselines3.common.vec_env import VecNormalize
 
 
 # this is a class for storing RL agents so that they can be looped through for training, testing, printing, callbacks to tensorboard,  etc.
 
 class ModelParking:
-    def __init__(self, model_dir=None, cached=False,  models=None, env=None):
+    def __init__(self, model_dir=None, cached=False,  models=None):
         """
         Initialize the ModelParking with an optional list of models.
         @param model_dir: Directory to save/load models. Defaults to "models".
@@ -38,15 +39,22 @@ class ModelParking:
             os.makedirs(model_dir)
         
 
-    def park_model(self, model, model_name=None, save=True, learn=False, steps=1000, callbacks=None):
+    def park_model(self, model, model_name=None, save=True, learn=False, steps=1000, callbacks=None, normalized=False, env=None):
         """
         Park the model for storage, also save the model to disc
-        @param model: The model to add.
-        @param model_name: Optional name for the model. If None, uses the class name.
-        @param save: Whether to save the model to disk.
-        @param learn: Whether to train the model.
-        @param steps: Number of training steps.
-        @param callbacks: List of callbacks to use during training.
+       
+        Args:
+            model: The model to add.
+            model_name: Optional name for the model. If None, uses the class name.
+            save: Whether to save the model to disk.
+            learn: Whether to train the model.
+            steps: Number of training steps.
+            callbacks: List of callbacks to use during training.
+            normalized: Whether to normalize the environment.
+            env: The environment to use for normalization.
+            model_dir: The directory to save the model to.
+
+        Returns:
         """
         if model_name is None:
             model_name = model.__class__.__name__
@@ -69,6 +77,9 @@ class ModelParking:
         if save:
             model.save(f"{self.model_dir}/{model_name}")
             logging.debug(f"Model '{model_name}' saved to {self.model_dir}.")
+            if normalized:
+                vecnorm: VecNormalize = env
+                vecnorm.save(f"{self.model_dir}/{model_name}_vecnorm.pkl")
         
     def get_model(self, model_name):
         """
@@ -83,6 +94,15 @@ class ModelParking:
         
         logging.warning(f"Model '{model_name}' not found in parking lot.")
         return None
+
+    def load_vecnorm(self, model_name, env=None):
+        """
+        Load the VecNormalize object for a model.
+        @param model_name: Name of the model to load the VecNormalize for.
+        @return: The VecNormalize object if found, None otherwise.
+        """
+        vecnorm = VecNormalize.load(f"{self.model_dir}/{model_name}_vecnorm.pkl", env)
+        return vecnorm  
     
     def list_models(self):
         """
