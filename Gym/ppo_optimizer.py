@@ -224,7 +224,7 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
         num_threads = min(os.cpu_count(), 16)
-        os.environ.setdefault("TORCH_NUM_THREADS",num_threads)           
+        os.environ.setdefault("TORCH_NUM_THREADS",str(num_threads))           
         os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
         torch.set_num_threads(int(os.environ["TORCH_NUM_THREADS"]))
         print(f"Using {int(num_threads)} CPU threads for training")

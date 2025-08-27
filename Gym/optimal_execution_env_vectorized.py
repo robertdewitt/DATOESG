@@ -1103,7 +1103,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         return self._np_random.choice(num_orders, size=num_episodes, replace=False).tolist()
 
 
-    def execute_orders_vectorized(self, model, order_indices, collect_step_info=True):
+    def execute_orders_vectorized(self, model, order_indices, collect_step_info=True, show_progress=True, model_name=None):
         """
         Unified vectorized execution method that processes orders in parallel batches.
         Collects full step-by-step data for analytics while maintaining high performance.
@@ -1112,28 +1112,206 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             model: The trained RL model
             order_indices: List of order indices to execute
             collect_step_info: If True, collect per-step info (default True for analytics)
+            show_progress: If True, show tqdm progress bar for episode execution
+            model_name: Optional model name to display in progress bar
     
-        Returns:
+        Returns:                                                                                                                                                                                                                                                                                                                                                                                                                                                            
             List of order execution data (list of lists of step dictionaries)
         """
         num_episodes = len(order_indices)
     
         # Process orders in batches for optimal performance
-        batch_size = min(self.num_envs, num_episodes)
-        num_batches = (num_episodes + batch_size - 1) // batch_size
+    
+        if num_episodes <= self.num_envs:
+            batch_size = num_episodes
+            num_batches = 1
+        else:
+            # Otherwise use full capacity of num_envs
+            batch_size = self.num_envs
+            num_batches = (num_episodes + batch_size - 1) // batch_size
     
         all_orders = []
     
+        # Create progress bar for episodes if requested
+        if show_progress:
+            # Create a descriptive label for the progress bar
+            if model_name:
+                desc = f"  Executing {num_episodes} orders with {model_name}"
+            else:
+                desc = f"  Executing {num_episodes} orders"
+            
+            # Use tqdm to track progress through batches, converting to episode count
+            pbar = tqdm(total=num_episodes, desc=desc, leave=False, 
+                       bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} orders [{elapsed}<{remaining}]')
+
+        logging.info(f"Executing {num_episodes} orders with {model_name} with {num_batches} batches of size {batch_size}")
+        
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, num_episodes)
             batch_indices = order_indices[start_idx:end_idx]
-        
+            
+            # Update progress bar
+            if show_progress:
+                pbar.update(len(batch_indices))
+
+
             # Execute this batch in parallel
-            batch_orders = self._execute_batch_parallel(model, batch_indices, collect_step_info)
+            batch_orders = self._execute_batch_parallel_revised(model, batch_indices, collect_step_info)
             all_orders.extend(batch_orders)
+            
+         
+        if show_progress:
+            pbar.close()
     
         return all_orders
+
+
+    def _execute_batch_parallel_revised(self, model, batch_indices, collect_step_info):
+        """
+        Execute a batch of orders in parallel using vectorized environments.
+        """
+        batch_size = len(batch_indices)
+    
+        # Pad batch if smaller than num_envs
+        if batch_size < self.num_envs:
+            padding_indices = [batch_indices[0]] * (self.num_envs - batch_size)
+            full_indices = batch_indices + padding_indices
+        else:
+            full_indices = batch_indices
+    
+        # Reset all environments
+        self.order_idx = torch.tensor(full_indices, device=self.device)
+        obs = self.reset(order_indices=full_indices)
+
+        if collect_step_info:
+            # Collect every Nth step to reduce overhead
+            COLLECTION_INTERVAL = 3  # Only collect every 3rd step
+        
+            max_horizon = self.time_horizon[:batch_size].max().item()
+            max_collected_steps = (max_horizon + COLLECTION_INTERVAL - 1) // COLLECTION_INTERVAL
+        
+            # Smaller tensors due to sparse collection
+            step_data = {
+                'shares_remaining': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'last_fill_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'last_trade_size': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'immediate_impact_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'accumulated_impact_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'order_vwap': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'action_percentage': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'bid_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'ask_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'mid_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'vwap_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'current_trade_volume': torch.zeros((batch_size, max_collected_steps), device=self.device),
+            }
+        
+            # Track actual steps collected per environment
+            steps_collected = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+            
+            # Cache constants once
+            order_constants = []
+            for i in range(batch_size):
+                order_constants.append({
+                    'order_idx': self.order_idx[i].item(),
+                    'ticker': self.tickers[i],
+                    'order_qty': self.order_qty[i].item(),
+                    'adv_pct': self.adv_pct[i].item(),
+                    'ehv_pct': self.ehv_pct[i].item(),
+                    'start_time': self.start_time[i].item(),
+                    'end_time': self.end_time[i].item(),
+                    'time_horizon': self.time_horizon[i].item(),
+                    'side': 'buy' if self.side[i].item() == 1 else 'sell',
+                    'arrival_price': self.arrival_price[i].item(),
+                    'adv': self.adv[i].item(),
+                    'date': str(self.order_dates[i]) if self.order_dates else None,
+                })
+        
+        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        step = 0
+        
+        while not done[:batch_size].all():
+            # Get actions
+            actions = np.zeros(self.num_envs, dtype=np.int32)
+            for i in range(self.num_envs):
+                if not done[i]:
+                    action, _ = model.predict(obs[i], deterministic=False)
+                    actions[i] = action
+            
+            # Step
+            self.step_async(actions)
+            obs, rewards, dones, infos = self.step_wait()
+            
+            # Only collect data every COLLECTION_INTERVAL steps
+            if collect_step_info and (step % COLLECTION_INTERVAL == 0):
+                collected_idx = step // COLLECTION_INTERVAL
+                if collected_idx < max_collected_steps:
+                    # Get market data once
+                    market_data = self._get_market_data_batch(
+                        ['trade_volume', 'vwap', 'trade_high', 'trade_low', 'bid_price', 'ask_price'],
+                        use_prior_step=True
+                    )
+                    
+                    # Only store for active environments
+                    active_mask = ~done[:batch_size]
+                    for i in range(batch_size):
+                        if active_mask[i]:
+                            step_data['shares_remaining'][i, collected_idx] = self.shares_remaining[i]
+                            step_data['last_fill_price'][i, collected_idx] = self.last_fill_price[i]
+                            step_data['last_trade_size'][i, collected_idx] = self.last_trade_size[i]
+                            step_data['immediate_impact_cost'][i, collected_idx] = self.immediate_impact_cost[i]
+                            step_data['accumulated_impact_cost'][i, collected_idx] = self.accumulated_impact_cost[i]
+                            step_data['order_vwap'][i, collected_idx] = self.order_vwap[i]
+                            step_data['action_percentage'][i, collected_idx] = self.last_action_fraction[i]
+                            step_data['bid_price'][i, collected_idx] = market_data['bid_price'][i]
+                            step_data['ask_price'][i, collected_idx] = market_data['ask_price'][i]
+                            step_data['mid_price'][i, collected_idx] = (market_data['bid_price'][i] + market_data['ask_price'][i]) * 0.5
+                            step_data['vwap_price'][i, collected_idx] = market_data['vwap'][i]
+                            step_data['current_trade_volume'][i, collected_idx] = market_data['trade_volume'][i]
+                            steps_collected[i] = collected_idx + 1
+            
+            done = torch.tensor(dones, device=self.device, dtype=torch.bool)
+            step += 1
+        
+        # Convert to list format
+        batch_orders = []
+        
+        if collect_step_info:
+            # CHANGE: Batch convert tensors to CPU
+            step_data_cpu = {k: v.cpu().numpy() for k, v in step_data.items()}
+            
+            for i in range(batch_size):
+                order_info = []
+                num_collected = steps_collected[i].item()
+                
+                for s in range(num_collected):
+                    info = order_constants[i].copy()
+                    info.update({
+                        'current_step': s * COLLECTION_INTERVAL,  # Actual step number
+                        'episode': batch_indices[i],
+                        'shares_remaining': float(step_data_cpu['shares_remaining'][i, s]),
+                        'last_fill_price': float(step_data_cpu['last_fill_price'][i, s]),
+                        'last_trade_size': float(step_data_cpu['last_trade_size'][i, s]),
+                        'immediate_impact_cost': float(step_data_cpu['immediate_impact_cost'][i, s]),
+                        'accumulated_impact_cost': float(step_data_cpu['accumulated_impact_cost'][i, s]),
+                        'order_vwap': float(step_data_cpu['order_vwap'][i, s]),
+                        'action_percentage': float(step_data_cpu['action_percentage'][i, s]),
+                        'bid_price': float(step_data_cpu['bid_price'][i, s]),
+                        'ask_price': float(step_data_cpu['ask_price'][i, s]),
+                        'mid_price': float(step_data_cpu['mid_price'][i, s]),
+                        'vwap_price': float(step_data_cpu['vwap_price'][i, s]),
+                        'current_trade_volume': float(step_data_cpu['current_trade_volume'][i, s]),
+                        'total_cost': self.total_cost[i].item(),
+                    })
+                    order_info.append(info)
+                
+                batch_orders.append(order_info)
+        else:
+            batch_orders = [[] for _ in range(batch_size)]
+        
+        return batch_orders
+
 
 
     def _execute_batch_parallel(self, model, batch_indices, collect_step_info):
@@ -1202,12 +1380,15 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         # Track which environments are done
         done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         step = 0
-    
-        while not done[:batch_size].all():
+
+        episode_complete = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        episode_data = [None] * batch_size  # Store completed episodes
+
+        while not episode_complete.all():
             # Get actions for all active environments
             actions = np.zeros(self.num_envs, dtype=np.int32)
-            for i in range(self.num_envs):
-                if not done[i]:
+            for i in range(batch_size):
+                if not episode_complete[i]:
                     if hasattr(model, 'predict'):
                         action, _ = model.predict(obs[i], deterministic=False)
                     else:
@@ -1217,11 +1398,28 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             # Step all environments
             self.step_async(actions)
             obs, rewards, dones, infos = self.step_wait()
+
+            for i in range(batch_size):
+                if dones[i] and not episode_complete[i]:
+                    # Save this episode's data immediately
+                    if collect_step_info:
+                        # Collect final data for episode i
+                        episode_data[i] = self._extract_episode_data(i)
+                    
+                    # Reset this specific environment to a dummy order
+                    # so it doesn't interfere with still-running episodes
+                    dummy_order_idx = batch_indices[0]  # Use first order as dummy
+                    episode_complete[i] = True
+                
+                    # Reset this specific environment to a dummy order
+                    # so it doesn't interfere with still-running episodes
+                    dummy_order_idx = batch_indices[0]  # Use first order as dummy
+                    self._reset_single_env(i, dummy_order_idx)
         
             if collect_step_info and step < max_horizon:
                 # Get market data once for all environments
                 market_data = self._get_market_data_batch(
-                    ['trade_volume', 'vwap', 'trade_high', 'trade_low'],
+                    ['trade_volume', 'vwap', 'trade_high', 'trade_low', 'bid_price', 'ask_price'],
                     use_prior_step=True
                 )
             
@@ -1238,6 +1436,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         step_data['action_percentage'][i, step] = self.last_action_fraction[i]
                         step_data['mid_price'][i, step] = (market_data['trade_high'][i] + market_data['trade_low'][i]) * 0.5
                         step_data['vwap_price'][i, step] = market_data['vwap'][i]
+                        step_data['bid_price'][i, step] = market_data['bid_price'][i]
+                        step_data['ask_price'][i, step] = market_data['ask_price'][i]
                         step_data['current_trade_volume'][i, step] = market_data['trade_volume'][i]
                         step_counts[i] = step + 1
         
