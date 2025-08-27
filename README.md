@@ -8,5 +8,7 @@ To reproduce the results, the parquet version of the data is provided so one can
 
 Here are the steps to proceed:
 
-1. clone the repo from github
-2. tar xvfz mana_data.tgz - this will unpack the parquet formed market data and analytics for the models to run against. 
+1. Clone the repo from github
+2. tar xvfz mana_data.tgz - this will unpack the parquet formed market data and analytics for the models to run against.
+3. Inside the Gym directory, the primary model driver can be found: research_train_test_vec.ipynb
+4. Run the cells sequentially and you should be able to reproduce the results as reported. All models are seeded so they should be deterministic. 
