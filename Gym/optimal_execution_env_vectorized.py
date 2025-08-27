@@ -190,6 +190,15 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.accumulated_impact = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.accumulated_impact_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.order_vwap = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        
+        # Cost components
+        self.arrival_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.vwap_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.rate_penalty = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.holding_risk_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.unfilled_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.total_step_cost = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        
         self.last_fill_price = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         self.last_trade_size = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
         self.last_action_fraction = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
@@ -474,6 +483,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.accumulated_impact.zero_()
         self.accumulated_impact_cost.zero_()
         self.order_vwap.zero_()
+        
+        # Reset cost components
+        self.arrival_cost.zero_()
+        self.vwap_cost.zero_()
+        self.rate_penalty.zero_()
+        self.holding_risk_cost.zero_()
+        self.unfilled_cost.zero_()
+        self.total_step_cost.zero_()
 
         # Return initial observations
         obs = self._get_observation()
@@ -733,6 +750,13 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         self.immediate_impact_cost[idx] = 0.0
         self.accumulated_impact_cost[idx] = 0.0
         self.order_vwap[idx]          = 0.0
+        # Reset cost components
+        self.arrival_cost[idx]        = 0.0
+        self.vwap_cost[idx]           = 0.0
+        self.rate_penalty[idx]        = 0.0
+        self.holding_risk_cost[idx]   = 0.0
+        self.unfilled_cost[idx]       = 0.0
+        self.total_step_cost[idx]     = 0.0
         self.last_fill_price[idx]     = 0.0
         self.last_trade_size[idx]     = 0
         self.last_action_fraction[idx]= 0.0
@@ -891,6 +915,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             rate_devitation_penalty = components['rate_penalty']
             holding_risk_cost = components['holding_risk_cost']
             unfilled_cost = components['unfilled_cost']
+            
+            # Store as instance variables for data collection
+            self.arrival_cost = arrival_cost
+            self.vwap_cost = vwap_cost
+            self.rate_penalty = rate_devitation_penalty
+            self.holding_risk_cost = holding_risk_cost
+            self.unfilled_cost = unfilled_cost
+            self.total_step_cost = total_step_cost
             
             # TEMP debug
             if should_log:
@@ -1259,6 +1291,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'shares_remaining': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'last_fill_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'last_trade_size': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'immediate_impact': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'accumulated_impact': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'immediate_impact_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'accumulated_impact_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'order_vwap': torch.zeros((batch_size, max_collected_steps), device=self.device),
@@ -1268,6 +1302,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'mid_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'vwap_price': torch.zeros((batch_size, max_collected_steps), device=self.device),
                 'current_trade_volume': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                # Cost components
+                'arrival_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'vwap_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'rate_penalty': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'holding_risk_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'unfilled_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'total_step_cost': torch.zeros((batch_size, max_collected_steps), device=self.device),
+                'total_reward': torch.zeros((batch_size, max_collected_steps), device=self.device),
             }
         
             # Track actual steps collected per environment
@@ -1323,6 +1365,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                             step_data['shares_remaining'][i, collected_idx] = self.shares_remaining[i]
                             step_data['last_fill_price'][i, collected_idx] = self.last_fill_price[i]
                             step_data['last_trade_size'][i, collected_idx] = self.last_trade_size[i]
+                            step_data['immediate_impact'][i, collected_idx] = self.immediate_impact[i]
+                            step_data['accumulated_impact'][i, collected_idx] = self.accumulated_impact[i]
                             step_data['immediate_impact_cost'][i, collected_idx] = self.immediate_impact_cost[i]
                             step_data['accumulated_impact_cost'][i, collected_idx] = self.accumulated_impact_cost[i]
                             step_data['order_vwap'][i, collected_idx] = self.order_vwap[i]
@@ -1332,6 +1376,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                             step_data['mid_price'][i, collected_idx] = (market_data['bid_price'][i] + market_data['ask_price'][i]) * 0.5
                             step_data['vwap_price'][i, collected_idx] = market_data['vwap'][i]
                             step_data['current_trade_volume'][i, collected_idx] = market_data['trade_volume'][i]
+                            # Cost components
+                            step_data['arrival_cost'][i, collected_idx] = self.arrival_cost[i]
+                            step_data['vwap_cost'][i, collected_idx] = self.vwap_cost[i]
+                            step_data['rate_penalty'][i, collected_idx] = self.rate_penalty[i]
+                            step_data['holding_risk_cost'][i, collected_idx] = self.holding_risk_cost[i]
+                            step_data['unfilled_cost'][i, collected_idx] = self.unfilled_cost[i]
+                            step_data['total_step_cost'][i, collected_idx] = self.total_step_cost[i]
+                            step_data['total_reward'][i, collected_idx] = self.total_cost[i]  # Cumulative total cost
                             steps_collected[i] = collected_idx + 1
             
             done = torch.tensor(dones, device=self.device, dtype=torch.bool)
@@ -1356,6 +1408,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         'shares_remaining': float(step_data_cpu['shares_remaining'][i, s]),
                         'last_fill_price': float(step_data_cpu['last_fill_price'][i, s]),
                         'last_trade_size': float(step_data_cpu['last_trade_size'][i, s]),
+                        'immediate_impact': float(step_data_cpu['immediate_impact'][i, s]),
+                        'accumulated_impact': float(step_data_cpu['accumulated_impact'][i, s]),
                         'immediate_impact_cost': float(step_data_cpu['immediate_impact_cost'][i, s]),
                         'accumulated_impact_cost': float(step_data_cpu['accumulated_impact_cost'][i, s]),
                         'order_vwap': float(step_data_cpu['order_vwap'][i, s]),
@@ -1365,6 +1419,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         'mid_price': float(step_data_cpu['mid_price'][i, s]),
                         'vwap_price': float(step_data_cpu['vwap_price'][i, s]),
                         'current_trade_volume': float(step_data_cpu['current_trade_volume'][i, s]),
+                        # Cost components
+                        'arrival_cost': float(step_data_cpu['arrival_cost'][i, s]),
+                        'vwap_cost': float(step_data_cpu['vwap_cost'][i, s]),
+                        'rate_penalty': float(step_data_cpu['rate_penalty'][i, s]),
+                        'holding_risk_cost': float(step_data_cpu['holding_risk_cost'][i, s]),
+                        'unfilled_cost': float(step_data_cpu['unfilled_cost'][i, s]),
+                        'total_step_cost': float(step_data_cpu['total_step_cost'][i, s]),
+                        'total_reward': float(step_data_cpu['total_reward'][i, s]),
                         'total_cost': self.total_cost[i].item(),
                     })
                     order_info.append(info)
@@ -1411,6 +1473,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'shares_remaining': torch.zeros((batch_size, max_horizon), device=self.device),
                 'last_fill_price': torch.zeros((batch_size, max_horizon), device=self.device),
                 'last_trade_size': torch.zeros((batch_size, max_horizon), device=self.device),
+                'immediate_impact': torch.zeros((batch_size, max_horizon), device=self.device),
+                'accumulated_impact': torch.zeros((batch_size, max_horizon), device=self.device),
                 'immediate_impact_cost': torch.zeros((batch_size, max_horizon), device=self.device),
                 'accumulated_impact_cost': torch.zeros((batch_size, max_horizon), device=self.device),
                 'order_vwap': torch.zeros((batch_size, max_horizon), device=self.device),
@@ -1418,6 +1482,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'mid_price': torch.zeros((batch_size, max_horizon), device=self.device),
                 'vwap_price': torch.zeros((batch_size, max_horizon), device=self.device),
                 'current_trade_volume': torch.zeros((batch_size, max_horizon), device=self.device),
+                # Cost components
+                'arrival_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'vwap_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'rate_penalty': torch.zeros((batch_size, max_horizon), device=self.device),
+                'holding_risk_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'unfilled_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'total_step_cost': torch.zeros((batch_size, max_horizon), device=self.device),
+                'total_reward': torch.zeros((batch_size, max_horizon), device=self.device),
             }
         
             # Cache constant order information
@@ -1493,6 +1565,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         step_data['shares_remaining'][i, step] = self.shares_remaining[i]
                         step_data['last_fill_price'][i, step] = self.last_fill_price[i]
                         step_data['last_trade_size'][i, step] = self.last_trade_size[i]
+                        step_data['immediate_impact'][i, step] = self.immediate_impact[i]
+                        step_data['accumulated_impact'][i, step] = self.accumulated_impact[i]
                         step_data['immediate_impact_cost'][i, step] = self.immediate_impact_cost[i]
                         step_data['accumulated_impact_cost'][i, step] = self.accumulated_impact_cost[i]
                         step_data['order_vwap'][i, step] = self.order_vwap[i]
@@ -1502,6 +1576,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         step_data['bid_price'][i, step] = market_data['bid_price'][i]
                         step_data['ask_price'][i, step] = market_data['ask_price'][i]
                         step_data['current_trade_volume'][i, step] = market_data['trade_volume'][i]
+                        # Cost components
+                        step_data['arrival_cost'][i, step] = self.arrival_cost[i]
+                        step_data['vwap_cost'][i, step] = self.vwap_cost[i]
+                        step_data['rate_penalty'][i, step] = self.rate_penalty[i]
+                        step_data['holding_risk_cost'][i, step] = self.holding_risk_cost[i]
+                        step_data['unfilled_cost'][i, step] = self.unfilled_cost[i]
+                        step_data['total_step_cost'][i, step] = self.total_step_cost[i]
+                        step_data['total_reward'][i, step] = self.total_cost[i]  # Cumulative total cost
                         step_counts[i] = step + 1
         
             done = torch.tensor(dones, device=self.device, dtype=torch.bool)
@@ -1523,6 +1605,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         'shares_remaining': step_data['shares_remaining'][i, s].item(),
                         'last_fill_price': step_data['last_fill_price'][i, s].item(),
                         'last_trade_size': step_data['last_trade_size'][i, s].item(),
+                        'immediate_impact': step_data['immediate_impact'][i, s].item(),
+                        'accumulated_impact': step_data['accumulated_impact'][i, s].item(),
                         'immediate_impact_cost': step_data['immediate_impact_cost'][i, s].item(),
                         'accumulated_impact_cost': step_data['accumulated_impact_cost'][i, s].item(),
                         'order_vwap': step_data['order_vwap'][i, s].item(),
@@ -1530,6 +1614,14 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                         'mid_price': step_data['mid_price'][i, s].item(),
                         'vwap_price': step_data['vwap_price'][i, s].item(),
                         'current_trade_volume': step_data['current_trade_volume'][i, s].item(),
+                        # Cost components
+                        'arrival_cost': step_data['arrival_cost'][i, s].item(),
+                        'vwap_cost': step_data['vwap_cost'][i, s].item(),
+                        'rate_penalty': step_data['rate_penalty'][i, s].item(),
+                        'holding_risk_cost': step_data['holding_risk_cost'][i, s].item(),
+                        'unfilled_cost': step_data['unfilled_cost'][i, s].item(),
+                        'total_step_cost': step_data['total_step_cost'][i, s].item(),
+                        'total_reward': step_data['total_reward'][i, s].item(),
                         'total_cost': self.total_cost[i].item(),
                     })
                     order_info.append(info)
