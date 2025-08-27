@@ -1,3 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 mana_data.tgz filter=lfs diff=lfs merge=lfs -text
+Gym/tca_data/tca_data_20250827_222846.parquet filter=lfs diff=lfs merge=lfs -text
