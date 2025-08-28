@@ -718,7 +718,7 @@ def create_execution_summary_table(orders_dict, trim=0):
     # Create header row
     header = f"{'Agent':<{agent_col_width}}"
     for col in columns:
-        header += f"{col:>{col_width}}"
+        header += f"{col:>{col_width}}|"
     print(header)
     print("-" * (agent_col_width + col_width * len(columns) + len(columns) - 1))
     
@@ -993,13 +993,23 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
             bin_edges = np.histogram_bin_edges(concat_vals, bins=bins)
 
         # Pre-compute bin centers/width for consistent histogram placement
-        all_bins = pd.IntervalIndex.from_breaks(bin_edges)
-        bin_centers = pd.Series(all_bins).apply(lambda iv: iv.mid).values
-        # Use 80% of min bin width, split across models
+        all_bins = pd.IntervalIndex.from_breaks(bin_edges, closed='right')
+        bin_centers = np.array([iv.mid for iv in all_bins], dtype=float)
+        # Use 80% of average bin width (more visible than min), split across models
         bin_widths = np.diff(bin_edges)
-        base_bar_width = (np.min(bin_widths) if len(bin_widths) > 0 else 1.0) * 0.8
+        pos_widths = bin_widths[bin_widths > 0] if len(bin_widths) > 0 else np.array([1.0])
+        avg_width = float(np.mean(pos_widths)) if pos_widths.size > 0 else 1.0
+        base_bar_width = avg_width * 0.8
         num_models = max(1, len(model_names))
         per_model_width = base_bar_width / num_models
+
+        # Improve layering so bars are visible behind lines
+        try:
+            ax_count.set_zorder(1)
+            ax.set_zorder(2)
+            ax.patch.set_alpha(0)
+        except Exception:
+            pass
 
         for mi, model_name in enumerate(model_names):
             label_name = (model_name or "")[0:25]
@@ -1021,13 +1031,28 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
                 se = (stds / np.sqrt(counts)).fillna(0.0) * 10000.0
             # Align counts to all bins for histogram bars
             # Ensure bin index alignment (closed='right' to match pd.cut default)
-            all_bins = pd.IntervalIndex.from_breaks(bin_edges, closed='right')
             counts_full = counts.reindex(all_bins, fill_value=0.0)
+            # Fallback: if counts are all zeros (index mismatch), recompute via np.histogram
+            if float(np.nansum(counts_full.values)) == 0.0 and dfv[factor].size > 0:
+                hist_counts, _ = np.histogram(dfv[factor].values.astype(float), bins=bin_edges)
+                counts_full = pd.Series(hist_counts.astype(float), index=all_bins)
             # Horizontal offset per model to avoid overlap
             offset = (mi - (num_models - 1) / 2.0) * per_model_width
             # Plot histogram bars on secondary axis
-            ax_count.bar(bin_centers + offset, counts_full.values, width=per_model_width,
-                         color=color_cycle[mi % len(color_cycle)], alpha=0.25, label=None)
+            ax_count.bar(
+                bin_centers + offset,
+                counts_full.values,
+                width=per_model_width,
+                color=color_cycle[mi % len(color_cycle)],
+                alpha=0.6,
+                edgecolor='none',
+                zorder=1,
+                label=None,
+            )
+            # Ensure count axis starts at zero for visibility
+            ymin, ymax = ax_count.get_ylim()
+            if ymin > 0:
+                ax_count.set_ylim(bottom=0)
 
             ax.errorbar(
                 pd.IntervalIndex(means.index).mid,
@@ -1036,9 +1061,12 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
                 label=label_name,
                 color=color_cycle[mi % len(color_cycle)],
                 marker='o',
-                linestyle='-'
+                linestyle='-',
+                zorder=2,
             )
 
+        # Ensure bars are within view on shared x-axis
+        ax.set_xlim(bin_edges[0], bin_edges[-1])
         ax.set_xlabel(factor)
         ax.grid(True, alpha=0.3)
         ax.legend(loc='best')
