@@ -13,7 +13,8 @@ class StandardExecutionCostModel:
       - Unfilled cost (expects base metric from env)
 
     All data preparation (market fetches, cumulative VWAP, masks) should be done
-    in the environment. This class only applies formulas and weights.
+    in the environment. This class only applies formulas and weights. This file contains 
+    nan protection for the cost model.
     """
 
     def __init__(
