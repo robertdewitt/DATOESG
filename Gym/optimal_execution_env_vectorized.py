@@ -1159,7 +1159,6 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         num_episodes = len(order_indices)
 
         self._evaluation_mode = True
-
     
         # Process orders in batches for optimal performance
     
@@ -1185,7 +1184,6 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
             pbar = tqdm(total=num_episodes, desc=desc, leave=False, 
                        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} orders [{elapsed}<{remaining}]')
 
-        logging.info(f"Executing {num_episodes} orders with {model_name} with {num_batches} batches of size {batch_size}")
         
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
@@ -1207,66 +1205,7 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
     
         return all_orders
 
-    def _execute_batch_parallel_DEBUG(self, model, batch_indices, collect_step_info):
-        print(f"\n=== DEBUG: Starting batch with {len(batch_indices)} orders ===")
-        batch_size = len(batch_indices)
-        
-        # Pad batch
-        if batch_size < self.num_envs:
-            padding_indices = [batch_indices[0]] * (self.num_envs - batch_size)
-            full_indices = batch_indices + padding_indices
-        else:
-            full_indices = batch_indices
-        
-        # Reset environments
-        print(f"DEBUG: Resetting environments with indices {batch_indices}")
-        self.order_idx = torch.tensor(full_indices, device=self.device)
-        obs = self.reset(order_indices=full_indices)
-        
-        # Print what we're executing
-        for i in range(batch_size):
-            print(f"  Order {i}: ticker={self.tickers[i]}, horizon={self.time_horizon[i].item()}, qty={self.order_qty[i].item()}")
-        
-        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        step = 0
-        
-        print(f"DEBUG: Starting execution loop")
-        
-        while not done[:batch_size].all():
-            if step % 10 == 0:
-                active = (~done[:batch_size]).sum().item()
-                remaining = self.shares_remaining[:batch_size].cpu().numpy()
-                current_steps = self.current_step[:batch_size].cpu().numpy()
-                print(f"Step {step}: {active} active | shares_remaining={remaining} | current_step={current_steps}")
-            
-            if step > 500:
-                print(f"ERROR: Infinite loop detected! Breaking at step {step}")
-                for i in range(batch_size):
-                    if not done[i]:
-                        print(f"  Stuck env {i}: step={self.current_step[i]}, horizon={self.time_horizon[i]}, shares={self.shares_remaining[i]}")
-                break
-            
-            # Get actions
-            actions = np.zeros(self.num_envs, dtype=np.int32)
-            for i in range(self.num_envs):
-                if not done[i]:
-                    action, _ = model.predict(obs[i], deterministic=False)
-                    actions[i] = action
-            
-            # Step
-            self.step_async(actions)
-            obs, rewards, dones, infos = self.step_wait()
-            
-            # Check what changed
-            if step < 5:  # First few steps
-                print(f"  Step {step} dones: {dones[:batch_size]}")
-            
-            done = torch.tensor(dones, device=self.device, dtype=torch.bool)
-            step += 1
-        
-        print(f"DEBUG: Execution complete after {step} steps")
-        return [[] for _ in range(batch_size)]  # Return empty for now
-
+    
 
     def _execute_batch_parallel_revised(self, model, batch_indices, collect_step_info):
         """
