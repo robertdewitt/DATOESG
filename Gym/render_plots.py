@@ -789,3 +789,271 @@ def create_execution_summary_table(orders_dict, trim=0):
     print("      Action percentages are in %")
     print("      Incomplete % shows orders not fully executed")
     print("      No Arrival % shows orders without arrival price data")
+
+
+def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_names=None):
+    """
+    Plots arrival price slippage (bps) with standard error bars for multiple models
+    across several explanatory factors on the x-axis. Each model is a separate line.
+
+    Args:
+        orders_dict: Dict[str, list[list[dict]]]
+            Keys are model names; values are lists of orders, where each order is a
+            list of per-step dictionaries (as produced by the vectorized executor).
+        factors: List[str] | None
+            X-axes to plot. Supported: 'ehv_pct', 'time_horizon', 'daily_volatility', 'intra_order_return'.
+            If None, defaults to the list above (will skip any missing columns gracefully).
+        bins: int
+            Number of bins for the x-axis when computing means/standard errors.
+        model_names: Optional[List[str]]
+            An explicit ordering of model names to plot. If None, uses orders_dict keys order.
+    """
+    if factors is None:
+        factors = ['ehv_pct', 'time_horizon', 'daily_volatility', 'intra_order_return']
+
+    def _orders_to_df(orders):
+        rows = []
+        for order_info in orders:
+            # Guard for numpy arrays/Series: use explicit length/None checks
+            if order_info is None:
+                continue
+            try:
+                is_empty = (len(order_info) == 0)
+            except Exception:
+                is_empty = False
+            if is_empty:
+                continue
+            first_step = order_info[0]
+            last_step = order_info[-1]
+
+            arrival_price = first_step.get('arrival_price', None)
+            order_vwap = last_step.get('order_vwap', None)
+            side = first_step.get('side', 'buy')
+
+            slippage = None
+            if arrival_price and order_vwap:
+                slippage = (arrival_price - order_vwap) / arrival_price
+                if side == 'sell':
+                    slippage = -slippage
+
+            intra_return = None
+            if arrival_price and (last_step.get('mid_price', None) is not None):
+                raw_return = (last_step['mid_price'] - arrival_price) / arrival_price
+                # Side-adjust: positive means favorable move (up for buys, down for sells)
+                intra_return = raw_return if side == 'buy' else -raw_return
+
+            rows.append({
+                'slippage': slippage,
+                'ehv_pct': first_step.get('ehv_pct', None),
+                'time_horizon': first_step.get('time_horizon', None),
+                'daily_volatility': first_step.get('daily_volatility', None),
+                'intra_order_return': intra_return,
+                'order_date': first_step.get('date', None),
+            })
+
+        if not rows:
+            return pd.DataFrame(columns=['slippage'] + (factors or []))
+        return pd.DataFrame(rows)
+
+    model_names = model_names or list(orders_dict.keys())
+    model_to_df = {name: _orders_to_df(orders_dict.get(name, [])) for name in model_names}
+
+    # Build figure with a top-wide plot for date and 2x2 below for factors
+    from matplotlib.dates import DateFormatter
+    fig = plt.figure(figsize=(14, 14))
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 0.8, 1.0, 1.0])
+    ax_top = fig.add_subplot(gs[0, :])
+    ax_box = fig.add_subplot(gs[1, :])
+    axes = [
+        fig.add_subplot(gs[2, 0]),
+        fig.add_subplot(gs[2, 1]),
+        fig.add_subplot(gs[3, 0]),
+        fig.add_subplot(gs[3, 1]),
+    ]
+
+    # Color cycle for multiple models (define before any plotting uses it)
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [
+        'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple',
+        'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan'
+    ])
+
+    # Top plot: slippage by date (per model), with histogram counts on secondary axis
+    # Gather all dates
+    all_dates = []
+    for df in model_to_df.values():
+        if 'order_date' in df.columns and df['order_date'].notna().any():
+            dates_series = pd.to_datetime(df['order_date'], errors='coerce').dropna().dt.date
+            if not dates_series.empty:
+                all_dates.append(dates_series.unique())
+    # Flatten and sort unique dates
+    if all_dates:
+        unique_dates = sorted(set(np.concatenate(all_dates)))
+        # Convert to week periods for aggregation and fewer ticks
+        week_periods = pd.to_datetime(pd.Series(unique_dates)).dt.to_period('W').dt.start_time.dt.date
+        unique_weeks = sorted(set(week_periods))
+        x_positions = np.arange(len(unique_weeks), dtype=float)
+        # Reasonable bar width per model
+        num_models = max(1, len(model_names))
+        per_model_width = 0.8 / num_models
+        # Secondary axis for counts
+        ax_top_count = ax_top.twinx()
+        ax_top.set_title("Arrival Slippage by Date")
+        ax_top.set_ylabel("Arrival Slippage (bps)")
+        ax_top_count.set_ylabel("Order Count")
+
+        for mi, model_name in enumerate(model_names):
+            label_name = (model_name or "")[0:25]
+            df = model_to_df[model_name]
+            if df.empty or 'slippage' not in df.columns:
+                continue
+            valid = df['slippage'].notna() & df['order_date'].notna()
+            if not valid.any():
+                continue
+            dfv = df.loc[valid, ['order_date', 'slippage']].copy()
+            dfv['order_date'] = pd.to_datetime(dfv['order_date'], errors='coerce').dt.to_period('W').dt.start_time.dt.date
+            dfv = dfv.dropna(subset=['order_date'])
+            grouped = dfv.groupby('order_date')['slippage']
+            means = grouped.mean() * 10000.0
+            counts = grouped.count().astype(float)
+            stds = grouped.std(ddof=1).fillna(0.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                se = (stds / np.sqrt(counts)).fillna(0.0) * 10000.0
+
+            # Align to all dates
+            means_full = pd.Series(index=unique_weeks, dtype=float)
+            means_full.loc[means.index] = means.values
+            se_full = pd.Series(index=unique_weeks, dtype=float)
+            se_full.loc[se.index] = se.values
+            counts_full = pd.Series(0.0, index=unique_weeks)
+            counts_full.loc[counts.index] = counts.values
+
+            # Plot counts as bars
+            offset = (mi - (num_models - 1) / 2.0) * per_model_width
+            ax_top_count.bar(x_positions + offset, counts_full.values, width=per_model_width,
+                             color=color_cycle[mi % len(color_cycle)], alpha=0.25)
+            # Plot mean slippage with SE
+            ax_top.errorbar(x_positions, means_full.values, yerr=se_full.values,
+                            label=label_name, color=color_cycle[mi % len(color_cycle)],
+                            marker='o', linestyle='-')
+
+        # Format x-axis with dates
+        ax_top.set_xticks(x_positions)
+        ax_top.set_xticklabels([pd.to_datetime(d).strftime('%Y-%m-%d') for d in unique_weeks], rotation=45, ha='right')
+        ax_top.grid(True, alpha=0.3)
+        ax_top.legend(loc='best')
+    else:
+        ax_top.text(0.5, 0.5, 'No date data to plot', ha='center', va='center', transform=ax_top.transAxes)
+
+    # Boxplot row: overall arrival slippage per model (bps)
+    box_data = []
+    box_labels = []
+    for model_name in model_names:
+        df = model_to_df[model_name]
+        if df.empty or 'slippage' not in df.columns:
+            continue
+        vals = (df['slippage'].dropna().values * 10000.0)
+        if vals.size == 0:
+            continue
+        box_data.append(vals)
+        box_labels.append((model_name or "")[0:25])
+    if box_data:
+        bp = ax_box.boxplot(box_data, patch_artist=True, labels=box_labels)
+        for i, patch in enumerate(bp['boxes']):
+            patch.set_facecolor(color_cycle[i % len(color_cycle)])
+            patch.set_alpha(0.25)
+        ax_box.set_title("Arrival Slippage Distribution (bps) by Model")
+        ax_box.set_ylabel("Arrival Slippage (bps)")
+        ax_box.grid(True, alpha=0.3)
+    else:
+        ax_box.text(0.5, 0.5, 'No slippage data for boxplot', ha='center', va='center', transform=ax_box.transAxes)
+
+    # Remaining 2x2 factors below
+    n_plots = min(4, len(factors))
+
+    for plot_idx, factor in enumerate(factors[:n_plots]):
+        ax = axes[plot_idx]
+        ax.set_title(f"Arrival Slippage vs {factor}")
+        ax.set_ylabel("Arrival Slippage (bps)")
+        # Secondary axis for order counts (histogram)
+        ax_count = ax.twinx()
+        ax_count.set_ylabel("Order Count")
+
+        all_values = []
+        for df in model_to_df.values():
+            if factor in df.columns and df[factor].notna().any():
+                all_values.append(df[factor].dropna().values)
+        if not all_values:
+            ax.text(0.5, 0.5, f"No data for {factor}", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        concat_vals = np.concatenate(all_values)
+        if np.nanmin(concat_vals) == np.nanmax(concat_vals):
+            bin_edges = np.linspace(concat_vals.min() - 0.5, concat_vals.max() + 0.5, bins + 1)
+        else:
+            bin_edges = np.histogram_bin_edges(concat_vals, bins=bins)
+
+        # Pre-compute bin centers/width for consistent histogram placement
+        all_bins = pd.IntervalIndex.from_breaks(bin_edges)
+        bin_centers = pd.Series(all_bins).apply(lambda iv: iv.mid).values
+        # Use 80% of min bin width, split across models
+        bin_widths = np.diff(bin_edges)
+        base_bar_width = (np.min(bin_widths) if len(bin_widths) > 0 else 1.0) * 0.8
+        num_models = max(1, len(model_names))
+        per_model_width = base_bar_width / num_models
+
+        for mi, model_name in enumerate(model_names):
+            label_name = (model_name or "")[0:25]
+            df = model_to_df[model_name]
+            if df.empty or 'slippage' not in df.columns:
+                continue
+            valid = df['slippage'].notna() & df[factor].notna()
+            dfv = df.loc[valid, [factor, 'slippage']].copy()
+            if dfv.empty:
+                continue
+
+            dfv['bin'] = pd.cut(dfv[factor], bins=bin_edges, include_lowest=True)
+            grouped = dfv.groupby('bin', observed=True)['slippage']
+
+            means = grouped.mean() * 10000.0
+            counts = grouped.count().astype(float)
+            stds = grouped.std(ddof=1).fillna(0.0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                se = (stds / np.sqrt(counts)).fillna(0.0) * 10000.0
+            # Align counts to all bins for histogram bars
+            # Ensure bin index alignment (closed='right' to match pd.cut default)
+            all_bins = pd.IntervalIndex.from_breaks(bin_edges, closed='right')
+            counts_full = counts.reindex(all_bins, fill_value=0.0)
+            # Horizontal offset per model to avoid overlap
+            offset = (mi - (num_models - 1) / 2.0) * per_model_width
+            # Plot histogram bars on secondary axis
+            ax_count.bar(bin_centers + offset, counts_full.values, width=per_model_width,
+                         color=color_cycle[mi % len(color_cycle)], alpha=0.25, label=None)
+
+            ax.errorbar(
+                pd.IntervalIndex(means.index).mid,
+                means.values,
+                yerr=se.values,
+                label=label_name,
+                color=color_cycle[mi % len(color_cycle)],
+                marker='o',
+                linestyle='-'
+            )
+
+        ax.set_xlabel(factor)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+
+    total_slots = len(axes)
+    for j in range(n_plots, total_slots):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plt.show()
+
+
+def create_execution_summary_and_plots(orders_dict, trim=0):
+    """
+    Print the execution summary table and then render the arrival slippage plots below it.
+    """
+    create_execution_summary_table(orders_dict, trim=trim)
+    plot_arrival_slippage_by_factors(orders_dict)
