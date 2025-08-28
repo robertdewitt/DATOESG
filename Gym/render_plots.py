@@ -35,13 +35,11 @@ COLOR = {
 def plot_orders(orders_dict, num_orders=3):
     """
     Plots the order information including prices, quantities, and action percentages for multiple models.
-    @param orders_dict: Dictionary where keys are model names and values are lists of order information dictionaries.
-                       Can also accept a single list for backward compatibility.
-    @param num_orders: Number of orders to plot per model.
-    Each order dictionary should contain keys like 'ticker', 'side', 'time_horizon', 'order_qty',
-    'current_step', 'mid_price', 'immediate_impact', 'action_percentage', 'accumulated_impact',
-    'last_fill_price', 'vwap_price', 'order_vwap', 'total_reward', 'last_trade_size', and 'shares_remaining'.
-    @return: None
+    Args:
+        orders_dict: Dictionary where keys are model names and values are lists of order information dictionaries.
+        num_orders: Number of orders to plot per model.
+    Returns:
+        None (prints the plot)
     """ 
     # Loop through each model
     for model_name, orders in orders_dict.items():
@@ -182,11 +180,12 @@ def plot_orders(orders_dict, num_orders=3):
 def display_order_info(orders_df, num_orders=3, name="Training"):
     """
     Displays order information in a readable format.
-    @param orders: List of order information dictionaries.
-    Each dictionary should contain keys like 'ticker', 'side', 'time_horizon', 'order_qty',
-    'current_step', 'mid_price', 'immediate_impact', 'action_percentage', 'accumulated_impact',
-    'last_fill_price', 'vwap_price', 'order_vwap', 'total_reward', 'last_trade_size', and 'shares_remaining'.
-    @return: None
+    Args:
+        orders_df: DataFrame containing order information.
+        num_orders: Number of orders to display.
+        name: Name of the dataset.
+    Returns:
+        None (prints the table)
     """
     print(f"{num_orders} {name} Orders:")
     print("========================================")
@@ -233,10 +232,14 @@ def display_order_info(orders_df, num_orders=3, name="Training"):
 def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', b_name='Test'):
     """
     Plots histograms of order characteristics comparing train and test distributions.
-    @param train_df: DataFrame containing training order information.
-    @param test_df: Optional DataFrame containing test order information.
-    @param date_col: Column name containing the date/time information.
-    @return: None
+    Args:
+        a_df: DataFrame containing order information for the first dataset.
+        b_df: DataFrame containing order information for the second dataset (optional).
+        date_col: Name of the date column in the dataframes.
+        a_name: Name of the first dataset.
+        b_name: Name of the second dataset.
+    Returns:
+        None (prints the plots)
     """
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     axes = axes.flatten()
@@ -495,12 +498,15 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     plt.show()
 
 
+
 def create_execution_summary_table(orders_dict, trim=0):
     """
     Creates a summary table of key execution metrics for multiple models/datasets.
-    @param orders_dict: Dictionary where keys are model/dataset names and values are lists of order information dictionaries.
-    @param trim: Trimming parameter for slippage (e.g., 0.01 for 1% top and bottom trim)
-    @return: None (prints the table)
+    Args:
+        orders_dict: Dictionary where keys are model/dataset names and values are lists of order information dictionaries.
+        trim: Trimming parameter for slippage (e.g., 0.01 for 1% top and bottom trim)
+    Returns:
+        None (prints the table)
     """
     
     def calculate_metrics(orders):
@@ -545,10 +551,9 @@ def create_execution_summary_table(orders_dict, trim=0):
                 # side adjustment for slippage direction
                 if first_step['side'] == 'sell':
                     slippage = -slippage
-                            # Calculate intra-order return
+                # Calculate intra-order return
                 intra_return = (last_step['mid_price'] - arrival_price) / arrival_price
                 weighted_return += intra_return * notional
-            
             else:
                 # Undefined arrival price – set slippage to 0 and warn once
                 slippage = 0.0
@@ -567,10 +572,9 @@ def create_execution_summary_table(orders_dict, trim=0):
             if completion_time is None:
                 completion_time = last_step['current_step']
             total_horizon = first_step['time_horizon']
-            duration_ratio = completion_time / total_horizon
+            duration_ratio = completion_time / total_horizon if total_horizon > 0 else 1.0
             weighted_duration += duration_ratio * notional
             durations.append(duration_ratio)
-            
             
             # Collect action percentages
             for step in order_info:
@@ -613,34 +617,56 @@ def create_execution_summary_table(orders_dict, trim=0):
             weighted_duration /= total_notional
             weighted_return /= total_notional
         
-        # Calculate standard deviations (using all data, not trimmed)
-        slippage_std = np.std(slippages) * 10000 if slippages else 0  # Convert to bps
-        duration_std = np.std(durations) if durations else 0
-        return_std = np.std(returns) * 10000 if returns else 0  # Convert to bps
-        action_std = np.std(action_percentages) * 100 if action_percentages else 0  # Convert to percentage
-        reward_std = np.std(rewards) * 10000 if rewards else 0  # Convert to bps
+        # Calculate standard errors (using all data, not trimmed)
+        n = len(slippages)
+        slippage_stderr = (np.std(slippages) / np.sqrt(n)) * 10000 if n > 0 else 0  # Convert to bps
+        duration_stderr = (np.std(durations) / np.sqrt(n)) if n > 0 else 0
+        return_stderr = (np.std(returns) / np.sqrt(n)) * 10000 if n > 0 else 0  # Convert to bps
+        action_stderr = (np.std(action_percentages) / np.sqrt(len(action_percentages))) * 100 if action_percentages else 0  # Convert to percentage
+        reward_stderr = (np.std(rewards) / np.sqrt(len(rewards))) * 10000 if rewards else 0  # Convert to bps
         
-        # Calculate mean action percentage
+        # Calculate mean action percentage and reward
         mean_action = np.mean(action_percentages) * 100 if action_percentages else 0  # Convert to percentage
         mean_reward = np.mean(rewards) * 10000 if rewards else 0  # Convert to bps
         
         # Calculate percentage of incomplete orders
         incomplete_pct = (incomplete_orders / total_orders * 100) if total_orders > 0 else 0
         
-        # orders with no arrival perventage 
+        # orders with no arrival percentage 
         orders_with_no_arrival_pct = (orders_with_no_arrival_price / total_orders * 100) if total_orders > 0 else 0
+        
+        # Calculate trimmed count and notional if trimming was applied
+        trimmed_count = 0
+        trimmed_notional = 0
+        if trim > 0 and len(slippage_notional_pairs) > 0:
+            # Count how many orders were trimmed (not included in the middle portion)
+            sorted_pairs = sorted(slippage_notional_pairs, key=lambda x: x[0])
+            total_notional_for_trim = sum(pair[1] for pair in sorted_pairs)
+            lower_trim_notional = total_notional_for_trim * trim
+            upper_trim_notional = total_notional_for_trim * (1 - trim)
+            
+            cumulative_notional = 0
+            for slippage, notional in sorted_pairs:
+                cumulative_notional += notional
+                if cumulative_notional < lower_trim_notional or cumulative_notional > upper_trim_notional:
+                    trimmed_count += 1
+                    trimmed_notional += notional
 
         return {
+            'Count': total_orders,
+            'Notional (M)': total_notional / 1e6,  # Convert to millions
+            'Trimmed Count': trimmed_count if trim > 0 else None,
+            'Trimmed Notional (M)': trimmed_notional / 1e6 if trim > 0 else None,  # Convert to millions
             'Weighted Slippage (bps)': weighted_slippage * 10000,  # Convert to basis points
-            'Slippage Std Dev (bps)': slippage_std,
+            'Slippage Std Err (bps)': slippage_stderr,
             'Weighted Duration Ratio': weighted_duration,
-            'Duration Std Dev': duration_std,
+            'Duration Std Err': duration_stderr,
             'Weighted Intra-Order Return (bps)': weighted_return * 10000,  # Convert to basis points
-            'Return Std Dev (bps)': return_std,
+            'Return Std Err (bps)': return_stderr,
             'Mean Reward (bps)': mean_reward,  # Already in bps
-            'Reward Std Dev (bps)': reward_std,
+            'Reward Std Err (bps)': reward_stderr,
             'Mean Action %': mean_action,
-            'Action % Std Dev': action_std,
+            'Action % Std Err': action_stderr,
             'Incomplete Orders %': incomplete_pct,
             'Orders with no arrival price %': orders_with_no_arrival_pct
         }
@@ -652,53 +678,114 @@ def create_execution_summary_table(orders_dict, trim=0):
     for model_name, orders in orders_dict.items():
         all_metrics[model_name] = calculate_metrics(orders)
     
-    # Create the table
-    print("\nExecution Summary Table")
-    print("=" * (30 + 16 * len(model_names) * 2))
-    
-    # Print number of orders
-    order_counts = " | ".join([f"{model}: {len(orders)}" for model, orders in orders_dict.items()])
-    print(f"Number of Orders - {order_counts}")
-    if trim > 0:
-        print(f"Slippage trimmed (top/bottom {trim:.1%} by notional weight)")
-    print("-" * (30 + 16 * len(model_names) * 2))
-    
-    # Create header with model names
-    header = f"{'Metric':<30}"
-    for model_name in model_names:
-        header += f"{model_name:>15} {model_name + ' Std':>15}"
-    print(header)
-    print("-" * (30 + 16 * len(model_names) * 2))
-    
-    # Define the metrics to display in order
-    metrics = [
-        ('Weighted Slippage (bps)', 'Slippage Std Dev (bps)'),
-        ('Weighted Duration Ratio', 'Duration Std Dev'),
-        ('Weighted Intra-Order Return (bps)', 'Return Std Dev (bps)'),
-        ('Mean Reward (bps)', 'Reward Std Dev (bps)'),
-        ('Mean Action %', 'Action % Std Dev'),
-        ('Incomplete Orders %', None),
-        ('Orders with no arrival price %', None)  # No std dev for percentage
+    # Define column headers (metrics)
+    columns = [
+        'Count',
+        'Notional (M)',
     ]
     
-    # Display each metric pair
-    for metric, std_metric in metrics:
-        row = f"{metric:<30}"
+    # Add trimmed columns if trimming is enabled
+    if trim > 0:
+        columns.extend(['Trim Count', 'Trim Not (M)'])
+    
+    columns.extend([
+        'Slippage (bps)',
+        'Slippage SE (bps)',
+        'Duration Ratio', 
+        'Duration SE',
+        'Return (bps)',
+        'Return SE (bps)',
+        'Reward (bps)',
+        'Reward SE (bps)',
+        'Action %',
+        'Action SE %',
+        'Incomplete %',
+        'No Arrival %'
+    ])
+    
+    # Create column width calculation
+    col_width = 12
+    agent_col_width = 20
+    
+    # Create the table
+    print("\nExecution Summary Table")
+    print("=" * (agent_col_width + col_width * len(columns) + len(columns) - 1))
+    
+    if trim > 0:
+        print(f"Slippage trimmed (top/bottom {trim:.1%} by notional weight)")
+        print("-" * (agent_col_width + col_width * len(columns) + len(columns) - 1))
+    
+    # Create header row
+    header = f"{'Agent':<{agent_col_width}}"
+    for col in columns:
+        header += f"{col:>{col_width}}"
+    print(header)
+    print("-" * (agent_col_width + col_width * len(columns) + len(columns) - 1))
+    
+    # Map column names to metric keys
+    column_to_metric = {
+        'Count': 'Count',
+        'Notional (M)': 'Notional (M)',
+        'Trim Count': 'Trimmed Count',
+        'Trim Not (M)': 'Trimmed Notional (M)',
+        'Slippage (bps)': 'Weighted Slippage (bps)',
+        'Slippage SE (bps)': 'Slippage Std Err (bps)',
+        'Duration Ratio': 'Weighted Duration Ratio',
+        'Duration SE': 'Duration Std Err',
+        'Return (bps)': 'Weighted Intra-Order Return (bps)',
+        'Return SE (bps)': 'Return Std Err (bps)',
+        'Reward (bps)': 'Mean Reward (bps)',
+        'Reward SE (bps)': 'Reward Std Err (bps)',
+        'Action %': 'Mean Action %',
+        'Action SE %': 'Action % Std Err',
+        'Incomplete %': 'Incomplete Orders %',
+        'No Arrival %': 'Orders with no arrival price %'
+    }
+    
+    # Print each agent as a row - handle duplicate names
+    model_name_counts = {}
+    for model_name in model_names:
+        model_metrics = all_metrics[model_name]
         
-        for model_name in model_names:
-            model_metrics = all_metrics[model_name]
-            value = f"{model_metrics[metric]:.2f}"
-            if std_metric and std_metric in model_metrics:
-                std_value = f"{model_metrics[std_metric]:.2f}"
-                row += f"{value:>15} {std_value:>15}"
-            else:
-                # For metrics without std dev (like Incomplete Orders %), just show the value twice or add spacing
-                row += f"{value:>15} {'-':>15}"
+        # Truncate and handle duplicates
+        truncated_name = model_name[:agent_col_width-2]
+        if truncated_name in model_name_counts:
+            model_name_counts[truncated_name] += 1
+            display_name = f"{truncated_name}_{model_name_counts[truncated_name]}"
+        else:
+            model_name_counts[truncated_name] = 0
+            display_name = truncated_name
+        
+        # Ensure display name fits in column width
+        display_name = display_name[:agent_col_width]
+        row = f"{display_name:<{agent_col_width}}"
+        
+        for col in columns:
+            metric_key = column_to_metric[col]
+            metric_value = model_metrics.get(metric_key)
             
+            # Skip None values for trimmed columns when trim=0
+            if metric_value is None:
+                continue
+                
+            if col == 'Count':
+                value = f"{int(metric_value):>{col_width}}"
+            elif col == 'Trim Count':
+                value = f"{int(metric_value):>{col_width}}"
+            elif col in ['Notional (M)', 'Trim Not (M)']:
+                value = f"{metric_value:>{col_width}.1f}"
+            elif col in ['Duration Ratio', 'Duration SE']:
+                value = f"{metric_value:>{col_width}.3f}"
+            else:
+                value = f"{metric_value:>{col_width}.2f}"
+            row += value
+        
         print(row)
     
-    print("=" * (30 + 16 * len(model_names) * 2))
-    print("Note: Slippage and Returns are in basis points (bps)")
+    print("=" * (agent_col_width + col_width * len(columns) + len(columns) - 1))
+    print("Note: Slippage, Returns, and Rewards are in basis points (bps)")
+    print("      SE = Standard Error (std/√n)")
     print("      Duration Ratio is completion time / total horizon")
     print("      Action percentages are in %")
-    print("      Incomplete Orders % shows orders not fully executed")
+    print("      Incomplete % shows orders not fully executed")
+    print("      No Arrival % shows orders without arrival price data")
