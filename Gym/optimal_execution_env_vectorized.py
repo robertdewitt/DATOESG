@@ -10,6 +10,12 @@ from tqdm import tqdm
 from stable_baselines3.common.vec_env import VecEnv
 from gpu_utils import get_torch_device, set_random_seed
 
+"""
+Vectorized version of MultiOrderExecutionEnv that can run multiple environments in parallel.
+This is a true vectorized environment that maintains separate state for each parallel environment
+while leveraging GPU acceleration for tensor operations.
+"""
+
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
