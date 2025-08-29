@@ -1085,3 +1085,220 @@ def create_execution_summary_and_plots(orders_dict, trim=0):
     """
     create_execution_summary_table(orders_dict, trim=trim)
     plot_arrival_slippage_by_factors(orders_dict)
+    plot_action_boxplots_by_normalized_horizon(orders_dict)
+    plot_orders(orders_dict, num_orders=3)
+
+
+def plot_action_boxplots_by_normalized_horizon(orders_dict, model_a=None, model_b=None, num_bins=10):
+    """
+    Plot side-by-side boxplots of actions (%) for two models across normalized horizon bins.
+
+    - Normalized horizon: current_step / time_horizon
+    - num_bins: number of equal-width bins on [0, 1]
+    - For each bin, show two boxplots side-by-side (one per model)
+
+    Args:
+        orders_dict: Dict[str, list[list[dict]]]
+        model_a: Optional[str] name of first model; defaults to first key
+        model_b: Optional[str] name of second model; defaults to second key
+        num_bins: int number of bins (default 10)
+    """
+
+    model_names = list(orders_dict.keys())
+    # Auto-select two PPO models if not specified
+    if model_a is None or model_b is None:
+        ppo_models = [m for m in model_names if 'ppo' in (m or '').lower()]
+        if len(ppo_models) >= 2:
+            if model_a is None:
+                model_a = ppo_models[0]
+            if model_b is None:
+                # pick the next distinct PPO model
+                model_b = next((m for m in ppo_models if m != model_a), None)
+        else:
+            # fallback to first two models
+            if len(model_names) >= 2:
+                model_a = model_a or model_names[0]
+                model_b = model_b or (model_names[1] if model_names[0] == model_a else model_names[0])
+            else:
+                print("plot_action_boxplots_by_normalized_horizon: need two models to compare")
+                return
+    if model_a not in orders_dict or model_b not in orders_dict:
+        print("plot_action_boxplots_by_normalized_horizon: specified models not in orders_dict")
+        return
+
+    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    bin_centers = (bins[:-1] + bins[1:]) * 0.5
+
+    def collect_actions_by_bin(orders):
+        per_bin = [[] for _ in range(num_bins)]
+        for order_info in orders:
+            if order_info is None:
+                continue
+            try:
+                if len(order_info) == 0:
+                    continue
+            except Exception:
+                pass
+            first = order_info[0]
+            horizon = first.get('time_horizon', None)
+            if horizon is None or horizon <= 0:
+                continue
+            for step in order_info:
+                if 'current_step' not in step:
+                    continue
+                # Get action as percentage; fallback to other keys if needed
+                if 'action_percentage' in step and step['action_percentage'] is not None:
+                    action_pct = step['action_percentage'] * 100.0
+                elif 'last_action_fraction' in step and step['last_action_fraction'] is not None:
+                    action_pct = float(step['last_action_fraction']) * 100.0
+                elif 'action' in step and step['action'] is not None:
+                    # assume in [0,1]; if already [0,100], min with 100
+                    val = float(step['action'])
+                    action_pct = val * 100.0 if val <= 1.0 else min(val, 100.0)
+                else:
+                    continue
+                norm = float(step['current_step']) / float(horizon)
+                if not np.isfinite(norm):
+                    continue
+                # Clamp to [0, 1]
+                norm = max(0.0, min(1.0, norm))
+                # Right-open except last bin
+                idx = int(np.digitize(norm, bins, right=False) - 1)
+                if idx < 0:
+                    idx = 0
+                if idx >= num_bins:
+                    idx = num_bins - 1
+                per_bin[idx].append(action_pct)
+        return per_bin
+
+    a_bins = collect_actions_by_bin(orders_dict[model_a])
+    b_bins = collect_actions_by_bin(orders_dict[model_b])
+
+    # Prepare boxplot inputs: for each bin, two datasets -> positions offset around bin center
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [
+        'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple',
+        'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan'
+    ])
+
+    # Compute mean and standard error per bin for each model
+    def compute_stats(per_bin_lists):
+        means = []
+        ses = []
+        counts = []
+        for lst in per_bin_lists:
+            arr = np.array(lst, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            n = arr.size
+            counts.append(n)
+            if n == 0:
+                means.append(np.nan)
+                ses.append(0.0)
+            else:
+                m = float(np.mean(arr))
+                s = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+                se = s / np.sqrt(n) if n > 0 else 0.0
+                means.append(m)
+                ses.append(se)
+        return np.array(means, dtype=float), np.array(ses, dtype=float), np.array(counts, dtype=float)
+
+    ma, sea, ca = compute_stats(a_bins)
+    mb, seb, cb = compute_stats(b_bins)
+
+    # Helper to compute side-adjusted intra-order return per order
+    def side_adjusted_return(order_info):
+        if order_info is None or len(order_info) == 0:
+            return np.nan
+        first = order_info[0]
+        last = order_info[-1]
+        arrival = first.get('arrival_price', None)
+        last_mid = last.get('mid_price', None)
+        if arrival in (None, 0, np.nan) or last_mid in (None, np.nan):
+            return np.nan
+        raw = (last_mid - arrival) / arrival
+        side = first.get('side', 'buy')
+        return raw if side == 'buy' else -raw
+
+    # Collect returns for tertile split across both models
+    returns_all = []
+    model_a_returns = []
+    model_b_returns = []
+    for oi in orders_dict[model_a]:
+        r = side_adjusted_return(oi)
+        model_a_returns.append(r)
+        if np.isfinite(r):
+            returns_all.append(r)
+    for oi in orders_dict[model_b]:
+        r = side_adjusted_return(oi)
+        model_b_returns.append(r)
+        if np.isfinite(r):
+            returns_all.append(r)
+
+    # Compute tertile thresholds
+    if len(returns_all) >= 3:
+        lo = float(np.nanpercentile(returns_all, 33.333))
+        hi = float(np.nanpercentile(returns_all, 66.667))
+    else:
+        lo, hi = -np.inf, np.inf
+
+    # Partition orders by tertile
+    def filter_orders_by_tertile(orders, returns, bucket):
+        subset = []
+        for oi, r in zip(orders, returns):
+            if not np.isfinite(r):
+                continue
+            if bucket == 'negative' and r < lo:
+                subset.append(oi)
+            elif bucket == 'neutral' and (r >= lo and r <= hi):
+                subset.append(oi)
+            elif bucket == 'positive' and r > hi:
+                subset.append(oi)
+        return subset
+
+    # For a given subset, recompute binned action stats
+    def stats_for_subset(subset_a, subset_b):
+        a_binned = collect_actions_by_bin(subset_a)
+        b_binned = collect_actions_by_bin(subset_b)
+        ma_s, sea_s, _ = compute_stats(a_binned)
+        mb_s, seb_s, _ = compute_stats(b_binned)
+        return ma_s, sea_s, mb_s, seb_s
+
+    la = (model_a or "")[0:25]
+    lb = (model_b or "")[0:25]
+
+    # Build 4 stacked panels: overall + positive + neutral + negative
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+    panels = [
+        (axes[0], "Actions by Normalized Horizon (Mean ± SE) — Overall", ma, sea, mb, seb),
+        (axes[1], "Positive Side-Adj Return (top tertile)",) + stats_for_subset(
+            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive'),
+            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive')
+        ),
+        (axes[2], "Neutral Side-Adj Return (middle tertile)",) + stats_for_subset(
+            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral'),
+            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral')
+        ),
+        (axes[3], "Negative Side-Adj Return (bottom tertile)",) + stats_for_subset(
+            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative'),
+            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative')
+        ),
+    ]
+
+    for ax, title, ma_p, sea_p, mb_p, seb_p in panels:
+        ax.set_title(title)
+        ax.set_ylabel("Action (%)")
+        # Model A
+        ax.plot(bin_centers, ma_p, color=color_cycle[0], marker='o', label=la)
+        ax.fill_between(bin_centers, ma_p - sea_p, ma_p + sea_p, color=color_cycle[0], alpha=0.2)
+        # Model B
+        ax.plot(bin_centers, mb_p, color=color_cycle[1], marker='o', label=lb)
+        ax.fill_between(bin_centers, mb_p - seb_p, mb_p + seb_p, color=color_cycle[1], alpha=0.2)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Normalized Horizon")
+    for ax in axes:
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xticks(bin_centers)
+    axes[0].legend(loc='best')
+
+    plt.tight_layout()
+    plt.show()
