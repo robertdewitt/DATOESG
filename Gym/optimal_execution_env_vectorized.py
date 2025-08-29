@@ -1229,8 +1229,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         obs = self.reset(order_indices=full_indices)
 
         if collect_step_info:
-            # Collect every Nth step to reduce overhead
-            COLLECTION_INTERVAL = 3  # Only collect every 3rd step
+            # Collect every step
+            COLLECTION_INTERVAL = 1
         
             max_horizon = self.time_horizon[:batch_size].max().item()
             max_collected_steps = (max_horizon + COLLECTION_INTERVAL - 1) // COLLECTION_INTERVAL

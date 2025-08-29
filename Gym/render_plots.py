@@ -514,11 +514,13 @@ def create_execution_summary_table(orders_dict, trim=0):
         weighted_slippage = 0
         weighted_duration = 0
         weighted_return = 0
+        weighted_cum_impact = 0
         rewards = []
         action_percentages = []
         slippages = []
         durations = []
         returns = []
+        cum_impacts = []
         incomplete_orders = 0
         orders_with_no_arrival_price = 0
         total_orders = len(orders)
@@ -530,16 +532,15 @@ def create_execution_summary_table(orders_dict, trim=0):
             # Get the first and last step info
             first_step = order_info[0]
             last_step = order_info[-1]
-
+            
             # Compute order notional (for weighting and logging)
             notional = first_step['order_qty'] * last_step['order_vwap']
 
-            # Compute slippage and intra-order return
+            # Compute slippage (adverse sign) and intra-order return
             arrival_price = first_step.get('arrival_price', 0)
             if arrival_price and arrival_price != 0:
-                slippage = (arrival_price - last_step['order_vwap']) / arrival_price
-                if first_step['side'] == 'sell':
-                    slippage = -slippage
+                side_sign = 1.0 if first_step.get('side', 'buy') == 'buy' else -1.0
+                slippage = side_sign * ((last_step['order_vwap'] - arrival_price) / arrival_price)
                 raw_return = (last_step['mid_price'] - arrival_price) / arrival_price
                 intra_return = raw_return if first_step.get('side', 'buy') == 'buy' else -raw_return
             else:
@@ -621,6 +622,18 @@ def create_execution_summary_table(orders_dict, trim=0):
             for step in order_info:
                 if 'action_percentage' in step:
                     action_percentages.append(step['action_percentage'])
+            
+            # Collect cumulative impact (use last step); fallback to cost if needed
+            cum_imp = last_step.get('accumulated_impact', None)
+            if cum_imp is None:
+                cum_imp = last_step.get('accumulated_impact_cost', None)
+            try:
+                if cum_imp is not None:
+                    cum_imp_float = float(cum_imp)
+                    weighted_cum_impact += cum_imp_float * notional
+                    cum_impacts.append(cum_imp_float)
+            except Exception:
+                pass
         
         # Apply trimming to slippage calculation
         if trim > 0 and len(slippage_notional_pairs) > 0:
@@ -657,6 +670,7 @@ def create_execution_summary_table(orders_dict, trim=0):
         if total_notional > 0:
             weighted_duration /= total_notional
             weighted_return /= total_notional
+            weighted_cum_impact /= total_notional
         
         # Calculate standard errors (using all data, not trimmed)
         n = len(slippages)
@@ -664,6 +678,7 @@ def create_execution_summary_table(orders_dict, trim=0):
         duration_stderr = (np.std(durations) / np.sqrt(n)) if n > 0 else 0
         return_stderr = (np.std(returns) / np.sqrt(n)) * 10000 if n > 0 else 0  # Convert to bps
         action_stderr = (np.std(action_percentages) / np.sqrt(len(action_percentages))) * 100 if action_percentages else 0  # Convert to percentage
+        cum_imp_stderr = (np.std(cum_impacts) / np.sqrt(len(cum_impacts))) * 10000 if cum_impacts else 0  # bps
         reward_stderr = (np.std(rewards) / np.sqrt(len(rewards))) * 10000 if rewards else 0  # Convert to bps
         
         # Calculate mean action percentage and reward
@@ -704,6 +719,8 @@ def create_execution_summary_table(orders_dict, trim=0):
             'Duration Std Err': duration_stderr,
             'Weighted Intra-Order Return (bps)': weighted_return * 10000,  # Convert to basis points
             'Return Std Err (bps)': return_stderr,
+            'Weighted Cumulative Impact (bps)': weighted_cum_impact * 10000,  # Convert to bps
+            'Cum Impact Std Err (bps)': cum_imp_stderr,
             'Mean Reward (bps)': mean_reward,  # Already in bps
             'Reward Std Err (bps)': reward_stderr,
             'Mean Action %': mean_action,
@@ -736,6 +753,8 @@ def create_execution_summary_table(orders_dict, trim=0):
         'Duration SE',
         'Return (bps)',
         'Return SE (bps)',
+        'Cum Impact (bps)',
+        'Cum Impact SE (bps)',
         'Reward (bps)',
         'Reward SE (bps)',
         'Action %',
@@ -775,6 +794,8 @@ def create_execution_summary_table(orders_dict, trim=0):
         'Duration SE': 'Duration Std Err',
         'Return (bps)': 'Weighted Intra-Order Return (bps)',
         'Return SE (bps)': 'Return Std Err (bps)',
+        'Cum Impact (bps)': 'Weighted Cumulative Impact (bps)',
+        'Cum Impact SE (bps)': 'Cum Impact Std Err (bps)',
         'Reward (bps)': 'Mean Reward (bps)',
         'Reward SE (bps)': 'Reward Std Err (bps)',
         'Action %': 'Mean Action %',
@@ -873,9 +894,8 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
 
             slippage = None
             if arrival_price and order_vwap:
-                slippage = (arrival_price - order_vwap) / arrival_price
-                if side == 'sell':
-                    slippage = -slippage
+                side_sign = 1.0 if side == 'buy' else -1.0
+                slippage = side_sign * ((order_vwap - arrival_price) / arrival_price)
 
             intra_return = None
             if arrival_price and (last_step.get('mid_price', None) is not None):
@@ -1160,17 +1180,153 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
     plt.show()
 
 
-def create_execution_summary_and_plots(orders_dict, trim=0):
+def _clean_orders_for_analysis(orders_dict, trim=0.01):
     """
-    Print the execution summary table and then render the arrival slippage plots below it.
+    Clean orders prior to analysis:
+      - Drop orders with |slippage| > 3 * sigma (sigma from daily_volatility or lag1)
+      - Drop orders with sigma > 0.5
+      - Trim orders outside slippage percentiles [trim, 1-trim]
+      Logs details for every dropped order.
+
+    Returns a new orders_dict with filtered orders.
     """
-    create_execution_summary_table(orders_dict, trim=trim)
-    plot_arrival_slippage_by_factors(orders_dict)
-    plot_action_boxplots_by_normalized_horizon(orders_dict)
-    plot_orders(orders_dict, num_orders=3)
+    cleaned = {}
+    for model_name, orders in orders_dict.items():
+        # Robust emptiness check (avoid ambiguous truth values for pandas objects)
+        is_empty = False
+        try:
+            is_empty = (orders is None) or (len(orders) == 0)
+        except Exception:
+            is_empty = True
+        if is_empty:
+            cleaned[model_name] = []
+            continue
+        # First pass: filter by sigma rules
+        kept = []
+        slippages_kept = []
+        for order_info in orders:
+            if order_info is None or len(order_info) == 0:
+                continue
+            first = order_info[0]
+            last = order_info[-1]
+            arrival = first.get('arrival_price', None)
+            vwap = last.get('order_vwap', None)
+            side = first.get('side', 'buy')
+            if arrival in (None, 0, np.nan) or vwap in (None, np.nan):
+                continue
+            slippage = (vwap - arrival) / arrival
+            if side == 'sell':
+                slippage = -slippage
+
+            dv = first.get('daily_volatility', None)
+            dv_val = None
+            if dv is not None:
+                try:
+                    dv_val = float(dv)
+                except Exception:
+                    dv_val = None
+            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0):
+                dv1 = first.get('daily_volatility_lag1', None)
+                if dv1 is not None:
+                    try:
+                        dv_val = float(dv1)
+                    except Exception:
+                        dv_val = None
+
+            # compute intra-order return for logging
+            last_mid = last.get('mid_price', None)
+            intr = 0.0
+            if (last_mid is not None) and (arrival not in (None, 0, np.nan)):
+                raw = (last_mid - arrival) / arrival
+                intr = raw if side == 'buy' else -raw
+
+            # drop if bad sigma
+            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0) or (dv_val >= 0.5):
+                logger.warning(
+                    "Dropping order (sigma invalid or >0.5): model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
+                    model_name,
+                    first.get('ticker', 'NA'),
+                    first.get('date', 'NA'),
+                    side,
+                    first.get('order_qty', 'NA'),
+                    first.get('time_horizon', 'NA'),
+                    f"{slippage * 10000.0:.1f}",
+                    f"{intr * 10000.0:.1f}",
+                    "NA" if dv_val is None else f"{dv_val:.4f}",
+                )
+                continue
+
+            # drop if |slippage| > 3*sigma
+            if abs(slippage) > 3.0 * dv_val:
+                logger.warning(
+                    "Dropping order (|slip|>3*sigma): model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f sigma=%.4f",
+                    model_name,
+                    first.get('ticker', 'NA'),
+                    first.get('date', 'NA'),
+                    side,
+                    first.get('order_qty', 'NA'),
+                    first.get('time_horizon', 'NA'),
+                    slippage * 10000.0,
+                    dv_val,
+                )
+                continue
+
+            kept.append(order_info)
+            slippages_kept.append(slippage)
+
+        # Second pass: trim by slippage percentiles
+        if kept and (trim is not None) and (trim > 0):
+            try:
+                low = float(np.nanpercentile(slippages_kept, trim * 100.0))
+                high = float(np.nanpercentile(slippages_kept, (1.0 - trim) * 100.0))
+            except Exception:
+                low, high = -np.inf, np.inf
+            trimmed = []
+            for order_info, slip in zip(kept, slippages_kept):
+                if slip < low or slip > high:
+                    first = order_info[0]
+                    last = order_info[-1]
+                    arrival = first.get('arrival_price', None)
+                    vwap = last.get('order_vwap', None)
+                    side = first.get('side', 'buy')
+                    last_mid = last.get('mid_price', None)
+                    intr = 0.0
+                    if (last_mid is not None) and (arrival not in (None, 0, np.nan)):
+                        raw = (last_mid - arrival) / arrival
+                        intr = raw if side == 'buy' else -raw
+                    logger.warning(
+                        "Trimming slippage outlier: model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f bounds=[%.1f, %.1f]",
+                        model_name,
+                        first.get('ticker', 'NA'),
+                        first.get('date', 'NA'),
+                        side,
+                        first.get('order_qty', 'NA'),
+                        first.get('time_horizon', 'NA'),
+                        slip * 10000.0,
+                        low * 10000.0,
+                        high * 10000.0,
+                    )
+                    continue
+                trimmed.append(order_info)
+            cleaned[model_name] = trimmed
+        else:
+            cleaned[model_name] = kept
+
+    return cleaned
 
 
-def plot_action_boxplots_by_normalized_horizon(orders_dict, model_a=None, model_b=None, num_bins=10):
+def create_execution_summary_and_plots(orders_dict, trim=0.01):
+    """
+    Clean data, print the execution summary table, and render plots.
+    """
+    cleaned = _clean_orders_for_analysis(orders_dict, trim=trim)
+    create_execution_summary_table(cleaned, trim=trim)
+    plot_arrival_slippage_by_factors(cleaned)
+    plot_actions_vs_normalized_horizon_with_returns(cleaned)
+    plot_orders(cleaned, num_orders=3)
+
+
+def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, model_b=None, num_bins=10):
     """
     Plot side-by-side boxplots of actions (%) for two models across normalized horizon bins.
 
@@ -1364,7 +1520,7 @@ def plot_action_boxplots_by_normalized_horizon(orders_dict, model_a=None, model_
         ),
     ]
 
-    for ax, title, ma_p, sea_p, mb_p, seb_p in panels:
+    def plot_panel(ax, title, ma_p, sea_p, mb_p, seb_p, subset_a, subset_b):
         ax.set_title(title)
         ax.set_ylabel("Action (%)")
         # Model A
@@ -1374,12 +1530,41 @@ def plot_action_boxplots_by_normalized_horizon(orders_dict, model_a=None, model_
         ax.plot(bin_centers, mb_p, color=color_cycle[1], marker='o', label=lb)
         ax.fill_between(bin_centers, mb_p - seb_p, mb_p + seb_p, color=color_cycle[1], alpha=0.2)
         ax.grid(True, alpha=0.3)
+        # Secondary axis: mean side-adjusted intra-order return (bps) for the subset
+        ax2 = ax.twinx()
+        def mean_return(orders):
+            vals = []
+            for oi in orders:
+                r = side_adjusted_return(oi)
+                if np.isfinite(r):
+                    vals.append(r)
+            return 0.0 if len(vals) == 0 else float(np.mean(vals)) * 10000.0
+        ax2.plot([bin_centers[0], bin_centers[-1]], [mean_return(subset_a)]*2, color=color_cycle[0], linestyle='--', alpha=0.4, label=f"{la} mean ret (bps)")
+        ax2.plot([bin_centers[0], bin_centers[-1]], [mean_return(subset_b)]*2, color=color_cycle[1], linestyle='--', alpha=0.4, label=f"{lb} mean ret (bps)")
+        ax2.set_ylabel("Mean Side-Adj Return (bps)")
+        try:
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc='best')
+        except Exception:
+            pass
+
+    plot_panel(axes[0], panels[0][1], panels[0][2], panels[0][3], panels[0][4], panels[0][5], orders_dict[model_a], orders_dict[model_b])
+    plot_panel(axes[1], panels[1][1], panels[1][2], panels[1][3], panels[1][4], panels[1][5],
+               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive'),
+               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive'))
+    plot_panel(axes[2], panels[2][1], panels[2][2], panels[2][3], panels[2][4], panels[2][5],
+               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral'),
+               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral'))
+    plot_panel(axes[3], panels[3][1], panels[3][2], panels[3][3], panels[3][4], panels[3][5],
+               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative'),
+               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative'))
 
     axes[-1].set_xlabel("Normalized Horizon")
     for ax in axes:
         ax.set_xlim(0.0, 1.0)
         ax.set_xticks(bin_centers)
-    axes[0].legend(loc='best')
+    # Legend handled per-panel
 
     plt.tight_layout()
     plt.show()
