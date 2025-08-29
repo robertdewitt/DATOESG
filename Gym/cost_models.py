@@ -65,16 +65,20 @@ class StandardExecutionCostModel:
         # Arrival cost
         weight = (trade_sizes.float() / oq).clamp_min(0.0)
 
-        # zero out any nans so they don't contribute to performance
-        price_perf = torch.nan_to_num((fill_prices - arrival_price) / arrival_price, nan=0.0, posinf=0.0, neginf=0.0)
+        # zero out any nans so they don't contribute to performance 
+        # clamp the price performance to ±3% to avoid potential issues with data quality 
+        # TODO: investigate cases where the price performance is outside of this range and why - this is generally not algorithm specific but market wide
+        price_perf = torch.nan_to_num((fill_prices - arrival_price) / arrival_price, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(-0.03).clamp_max(0.03)
         arrival_cost = self.arrival_cost_weight * side.float() * price_perf * weight
 
         #logging.info(f"arrival_cost: {arrival_cost}, side: {side}, price_perf: {price_perf}, weight: {weight}, fill_prices: {fill_prices}, arrival_price: {arrival_price}, order_qty: {order_qty}, order_vwap: {order_vwap}, sigma_step: {sigma_step}, shares_remaining: {shares_remaining}, adv: {adv}, time_horizon: {time_horizon}, current_step: {current_step}, cum_market_volume: {cum_market_volume}, cum_market_dollars: {cum_market_dollars}")
 
         market_ivwap = torch.nan_to_num(cum_market_dollars / cum_market_volume.clamp_min(1.0),
                                 nan=0.0, posinf=0.0, neginf=0.0)
+         # clamp the price performance to ±3% to avoid potential issues with data quality 
+        # TODO: investigate cases where the price performance is outside of this range and why - this is generally not algorithm specific but market wide
         vwap_slippage = torch.nan_to_num((order_vwap - market_ivwap) / market_ivwap.clamp_min(1e-6),
-                                 nan=0.0, posinf=0.0, neginf=0.0)
+                                 nan=0.0, posinf=0.0, neginf=0.0).clamp_min(-0.03).clamp_max(0.03)
         vwap_cost = self.vwap_cost_weight * side.float() * vwap_slippage * weight
         vwap_cost = torch.where(trade_sizes > 0, vwap_cost, torch.zeros_like(vwap_cost))
 

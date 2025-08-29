@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MINUTES_PER_DAY = 390.0
-POV_CAP = 10.0 # Cap minutely POV at 10x volume
+POV_CAP = 1.0 # Cap minutely POV at 50% of minute volume to avoid dislocations
 
 # TODO: integrate minutely volume and volatility profiles 
 
@@ -535,6 +535,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         epsilon = self.side.float() * torch.sqrt(minute_pov_safe.clamp_min(0.0))
         # Deterministic immediate term is Y * ε_t
         deterministic_impact = self.env_impact_coef * epsilon  
+        # Clamp immediate impact to a realistic band (±3%) to avoid price dislocations
+        deterministic_impact = torch.clamp(deterministic_impact, min=-0.03, max=0.03)
         
         return deterministic_impact
 
@@ -838,6 +840,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
         decay_rate_safe = torch.clamp(self.env_decay_rate, min=0.5)
         lambda_decay = torch.exp(-delta_t / decay_rate_safe)
         self.accumulated_impact = lambda_decay * self.accumulated_impact + self.immediate_impact
+        # Clamp accumulated impact as well to keep fill prices in a realistic range
+        self.accumulated_impact = torch.clamp(self.accumulated_impact, min=-0.03, max=0.03)
         fill_prices = vwap_prices * (1 + self.accumulated_impact)
         # Diagnostics for non-finite fill prices
         if torch.any(~torch.isfinite(fill_prices)):
@@ -1276,6 +1280,18 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                     'arrival_price': self.arrival_price[i].item(),
                     'adv': self.adv[i].item(),
                     'date': str(self.order_dates[i]) if self.order_dates else None,
+                    'daily_volatility': (
+                        float(self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility'))
+                        if ('daily_volatility' in self.orders_df.columns and
+                            self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility') is not None)
+                        else None
+                    ),
+                    'daily_volatility_lag1': (
+                        float(self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility_lag1'))
+                        if ('daily_volatility_lag1' in self.orders_df.columns and
+                            self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility_lag1') is not None)
+                        else None
+                    ),
                 })
         
         done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1453,6 +1469,18 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                     'arrival_price': self.arrival_price[i].item(),
                     'adv': self.adv[i].item(),
                     'date': str(self.order_dates[i]) if self.order_dates else None,
+                    'daily_volatility': (
+                        float(self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility'))
+                        if ('daily_volatility' in self.orders_df.columns and
+                            self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility') is not None)
+                        else None
+                    ),
+                    'daily_volatility_lag1': (
+                        float(self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility_lag1'))
+                        if ('daily_volatility_lag1' in self.orders_df.columns and
+                            self.orders_df.iloc[self.order_idx[i].item()].get('daily_volatility_lag1') is not None)
+                        else None
+                    ),
                 })
         
             step_counts = torch.zeros(batch_size, dtype=torch.int32, device=self.device)

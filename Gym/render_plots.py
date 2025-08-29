@@ -31,7 +31,6 @@ COLOR = {
     'total_step_cost': 'tab:red',
 }
 
-
 def plot_orders(orders_dict, num_orders=3):
     """
     Plots the order information including prices, quantities, and action percentages for multiple models.
@@ -531,35 +530,77 @@ def create_execution_summary_table(orders_dict, trim=0):
             # Get the first and last step info
             first_step = order_info[0]
             last_step = order_info[-1]
-            
-            # Check if order is incomplete (shares_remaining > 0)
-            if last_step.get('shares_remaining', 0) > 0:
-                incomplete_orders += 1
-            
-            # Calculate order notional value assuming all currency is the same (USD in this case)
+
+            # Compute order notional (for weighting and logging)
             notional = first_step['order_qty'] * last_step['order_vwap']
-            total_notional += notional
-            
-            # Calculate total reward for the order
-            total_reward = last_step.get('total_reward', 0)
-            rewards.append(total_reward)
-            
-            # Calculate slippage (VWAP vs arrival price)
+
+            # Compute slippage and intra-order return
             arrival_price = first_step.get('arrival_price', 0)
             if arrival_price and arrival_price != 0:
                 slippage = (arrival_price - last_step['order_vwap']) / arrival_price
-                # side adjustment for slippage direction
                 if first_step['side'] == 'sell':
                     slippage = -slippage
-                # Calculate intra-order return
-                intra_return = (last_step['mid_price'] - arrival_price) / arrival_price
-                weighted_return += intra_return * notional
+                raw_return = (last_step['mid_price'] - arrival_price) / arrival_price
+                intra_return = raw_return if first_step.get('side', 'buy') == 'buy' else -raw_return
             else:
-                # Undefined arrival price – set slippage to 0 and warn once
                 slippage = 0.0
                 intra_return = 0.0
                 orders_with_no_arrival_price += 1
 
+            # Sigma-based outlier filter (drop if either metric > 3 × sigma)
+            # Determine sigma from analytics-provided daily_volatility; fall back to lag1
+            dv_obj = first_step.get('daily_volatility', None)
+            dv_val = None
+            if dv_obj is not None:
+                try:
+                    dv_val = float(dv_obj)
+                except Exception:
+                    dv_val = None
+            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0):
+                dv1_obj = first_step.get('daily_volatility_lag1', None)
+                if dv1_obj is not None:
+                    try:
+                        dv_val = float(dv1_obj)
+                    except Exception:
+                        dv_val = None
+            if dv_val is not None and dv_val > 0 and dv_val < 2.0:
+                if (abs(slippage) > 3.0 * dv_val) or (abs(intra_return) > 3.0 * dv_val):
+                    logger.warning(
+                        "Dropping outlier order: ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f intra_ret_bps=%.1f sigma=%.4f",
+                        first_step.get('ticker', 'NA'),
+                        first_step.get('date', 'NA'),
+                        first_step.get('side', 'NA'),
+                        first_step.get('order_qty', 'NA'),
+                        first_step.get('time_horizon', 'NA'),
+                        slippage * 10000.0,
+                        intra_return * 10000.0,
+                        dv_val,
+                    )
+                    continue
+
+            else:
+                logger.warning(
+                    "Dropping order due to no daily volatility: ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
+                    first_step.get('ticker', 'NA'),
+                    first_step.get('date', 'NA'),
+                    first_step.get('side', 'NA'),
+                    first_step.get('order_qty', 'NA'),
+                    first_step.get('time_horizon', 'NA'),
+                    f"{slippage * 10000.0:.1f}",
+                    f"{intra_return * 10000.0:.1f}",
+                    "NA" if dv_val is None else f"{dv_val:.4f}",
+                )
+
+            # Accumulate only non-outliers
+            total_notional += notional
+            total_reward = last_step.get('total_reward', 0)
+            rewards.append(total_reward)
+
+            # Incomplete check (count only if kept)
+            if last_step.get('shares_remaining', 0) > 0:
+                incomplete_orders += 1
+
+            weighted_return += intra_return * notional
             returns.append(intra_return)
             slippages.append(slippage)
             slippage_notional_pairs.append((slippage, notional))
@@ -841,6 +882,46 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
                 raw_return = (last_step['mid_price'] - arrival_price) / arrival_price
                 # Side-adjust: positive means favorable move (up for buys, down for sells)
                 intra_return = raw_return if side == 'buy' else -raw_return
+
+            # Sigma-based outlier filter when daily_volatility available
+            # Determine sigma for plotting filter from analytics; fall back to lag1
+            dv_obj = first_step.get('daily_volatility', None)
+            dv_val = None
+            if dv_obj is not None:
+                try:
+                    dv_val = float(dv_obj)
+                except Exception:
+                    dv_val = None
+            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0):
+                dv1_obj = first_step.get('daily_volatility_lag1', None)
+                if dv1_obj is not None:
+                    try:
+                        dv_val = float(dv1_obj)
+                    except Exception:
+                        dv_val = None
+            if (dv_val is not None and dv_val > 0 and dv_val < 2.0) and (slippage is not None or intra_return is not None):
+                if ((slippage is not None and abs(slippage) > 3.0 * dv_val) or
+                    (intra_return is not None and abs(intra_return) > 3.0 * dv_val)):
+                    logger.warning(
+                        "Dropping outlier order in plotting: ticker=%s date=%s side=%s slippage_bps=%s intra_ret_bps=%s sigma=%.4f",
+                        first_step.get('ticker', 'NA'),
+                        first_step.get('date', 'NA'),
+                        first_step.get('side', 'NA'),
+                        'NA' if slippage is None else f"{slippage * 10000.0:.1f}",
+                        'NA' if intra_return is None else f"{intra_return * 10000.0:.1f}",
+                        dv_val,
+                    )
+                    continue
+            else:
+                logger.warning(
+                    "Dropping order due to no daily volatility: ticker=%s date=%s side=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
+                    first_step.get('ticker', 'NA'),
+                    first_step.get('date', 'NA'),
+                    first_step.get('side', 'NA'),
+                    'NA' if slippage is None else f"{slippage * 10000.0:.1f}",
+                    'NA' if intra_return is None else f"{intra_return * 10000.0:.1f}",
+                    "NA" if dv_val is None else f"{dv_val:.4f}",
+                )
 
             rows.append({
                 'slippage': slippage,
