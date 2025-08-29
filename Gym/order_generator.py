@@ -138,6 +138,10 @@ class OrderGenerator:
 
         # Build allowed mask of same shape as matrices
         allowed_pairs_mask = np.zeros_like(base_valid_mask, dtype=bool)
+        # Prepare date normalization for propagator keys
+        from datetime import datetime as _dt
+        date_fmt = getattr(self.propagator_loader, 'date_format', '%Y%m%d') if self.propagator_loader is not None else '%Y%m%d'
+
         for (i, j) in valid_indices:
             sym = available_stocks[i]
             dt = unique_dates[j]
@@ -153,12 +157,24 @@ class OrderGenerator:
                     dv_ok = False
             # r2
             r2_ok = True  # default to True if missing
-            if key in params_dict and isinstance(params_dict[key], dict):
-                r2 = params_dict[key].get('r2', None)
-                try:
-                    r2_ok = (r2 is not None) and np.isfinite(float(r2)) and (float(r2) >= 0.02)
-                except Exception:
-                    r2_ok = False
+            if params_dict:
+                # Match propagator dict keys: (SYMBOL_UPPER, normalized_date_str)
+                if isinstance(dt, str):
+                    norm_date = dt
+                elif isinstance(dt, _dt) or hasattr(dt, 'strftime'):
+                    try:
+                        norm_date = dt.strftime(date_fmt)
+                    except Exception:
+                        norm_date = str(dt)
+                else:
+                    norm_date = str(dt)
+                pkey = (sym.upper(), norm_date)
+                if pkey in params_dict and isinstance(params_dict[pkey], dict):
+                    r2 = params_dict[pkey].get('r2', None)
+                    try:
+                        r2_ok = (r2 is not None) and np.isfinite(float(r2)) and (float(r2) >= 0.02)
+                    except Exception:
+                        r2_ok = False
             if dv_ok and r2_ok:
                 allowed_pairs_mask[i, j] = True
 
@@ -212,7 +228,7 @@ class OrderGenerator:
         
         logger.info(f"Propagator parameters loaded in {time.time() - prop_start:.2f}s")
         
-        # Step 6.1: Quality filter — drop orders with bad volatility or low propagator R^2
+        # Step 6.1: Post-sampling quality filter (diagnostic) — confirm prefilter effectiveness
         pre_filter_count = len(orders_df)
         orders_df = self._filter_orders_quality(orders_df)
         dropped = pre_filter_count - len(orders_df)
