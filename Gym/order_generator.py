@@ -110,13 +110,72 @@ class OrderGenerator:
         
         logger.info(f"Matrix built in {time.time() - matrix_start:.2f}s")
         
-        # Step 2: Generate valid orders
-        logger.info("Generating valid orders...")
+        # Step 2: Pre-filter population by analytics and propagator quality BEFORE sampling
+        logger.info("Filtering population by volatility and R^2 before sampling...")
+        filter_start = time.time()
+        base_valid_mask = (availability_matrix > 0) & (adv_matrix > 0)
+        valid_indices = np.argwhere(base_valid_mask)
+        if valid_indices.size == 0:
+            raise ValueError("No valid stock-date pairs after base availability/ADV filter")
+
+        # Build pairs (symbol, date) for base-valid slots
+        symbol_date_pairs = [(available_stocks[i], unique_dates[j]) for i, j in valid_indices]
+        # Load daily volatility for these pairs
+        analytics_dict = self.analytics.get_analytics_bulk(symbol_date_pairs) if self.analytics is not None else {}
+        # Load propagator params including R^2 for these pairs
+        params_dict = {}
+        if self.propagator_loader is not None:
+            try:
+                params_dict = self.propagator_loader.get_params_batch(
+                    symbol_date_pairs,
+                    fallback_days=5,
+                    y_column=self.y_column,
+                    tau_column=self.tau_column,
+                    include_r2=True
+                )
+            except Exception as e:
+                logger.warning(f"Propagator get_params_batch failed for prefilter: {e}")
+
+        # Build allowed mask of same shape as matrices
+        allowed_pairs_mask = np.zeros_like(base_valid_mask, dtype=bool)
+        for (i, j) in valid_indices:
+            sym = available_stocks[i]
+            dt = unique_dates[j]
+            key = (sym, dt)
+            # analytics dv
+            dv_ok = False
+            if key in analytics_dict:
+                dv = analytics_dict[key].get('daily_volatility', None)
+                try:
+                    dv_val = float(dv)
+                    dv_ok = np.isfinite(dv_val) and (dv_val > 0.0) and (dv_val <= 0.5)
+                except Exception:
+                    dv_ok = False
+            # r2
+            r2_ok = True  # default to True if missing
+            if key in params_dict and isinstance(params_dict[key], dict):
+                r2 = params_dict[key].get('r2', None)
+                try:
+                    r2_ok = (r2 is not None) and np.isfinite(float(r2)) and (float(r2) >= 0.02)
+                except Exception:
+                    r2_ok = False
+            if dv_ok and r2_ok:
+                allowed_pairs_mask[i, j] = True
+
+        if not allowed_pairs_mask.any():
+            raise ValueError("No stock-date pairs passed volatility and R^2 filters before sampling")
+
+        logger.info(f"Population filtered in {time.time() - filter_start:.2f}s; allowed pairs: {int(allowed_pairs_mask.sum())}")
+
+        # Step 3: Generate valid orders (from filtered population only)
+        number_of_valid_stocks = int(allowed_pairs_mask.sum())
+        logger.info(f"Generating valid orders from filtered population...")
+
         gen_start = time.time()
         
         valid_orders_data = self._sample_valid_orders(
             availability_matrix, adv_matrix, available_stocks, unique_dates, 
-            self.num_orders, rng
+            self.num_orders, rng, allowed_pairs_mask=allowed_pairs_mask
         )
         
         logger.info(f"Orders sampled in {time.time() - gen_start:.2f}s")
@@ -238,7 +297,7 @@ class OrderGenerator:
 
     def _sample_valid_orders(self, availability_matrix: np.ndarray, adv_matrix: np.ndarray,
                            stocks: List[str], dates: List[date], num_orders: int, 
-                           rng: np.random.RandomState) -> Dict:
+                           rng: np.random.RandomState, allowed_pairs_mask: Optional[np.ndarray] = None) -> Dict:
         """
         Sample valid stock-date pairs for order generation.
         @param availability_matrix: Matrix of available minutes
@@ -249,8 +308,13 @@ class OrderGenerator:
         @param rng: Random number generator
         @return: Dictionary with order data
         """
-        # Find valid stock-date pairs (where we have both data and ADV)
-        valid_pairs = np.argwhere((availability_matrix > 0) & (adv_matrix > 0))
+        # Find valid stock-date pairs (availability & ADV), intersect with allowed_pairs_mask if provided
+        base_mask = (availability_matrix > 0) & (adv_matrix > 0)
+        if allowed_pairs_mask is not None:
+            if allowed_pairs_mask.shape != base_mask.shape:
+                raise ValueError("allowed_pairs_mask shape must match availability/adv matrices")
+            base_mask = base_mask & allowed_pairs_mask
+        valid_pairs = np.argwhere(base_mask)
         
         if len(valid_pairs) == 0:
             # Debug information to help diagnose the issue

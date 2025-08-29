@@ -538,11 +538,18 @@ def create_execution_summary_table(orders_dict, trim=0):
 
             # Compute slippage (adverse sign) and intra-order return
             arrival_price = first_step.get('arrival_price', 0)
+            side_val = first_step.get('side', None)
+            if (side_val not in ('buy', 'sell')):
+                logger.warning(
+                    "Dropping order due to missing/invalid side: ticker=%s date=%s",
+                    first_step.get('ticker', 'NA'), first_step.get('date', 'NA')
+                )
+                continue
             if arrival_price and arrival_price != 0:
-                side_sign = 1.0 if first_step.get('side', 'buy') == 'buy' else -1.0
+                side_sign = 1.0 if side_val == 'buy' else -1.0
                 slippage = side_sign * ((last_step['order_vwap'] - arrival_price) / arrival_price)
                 raw_return = (last_step['mid_price'] - arrival_price) / arrival_price
-                intra_return = raw_return if first_step.get('side', 'buy') == 'buy' else -raw_return
+                intra_return = raw_return if side_val == 'buy' else -raw_return
             else:
                 slippage = 0.0
                 intra_return = 0.0
@@ -890,7 +897,10 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
 
             arrival_price = first_step.get('arrival_price', None)
             order_vwap = last_step.get('order_vwap', None)
-            side = first_step.get('side', 'buy')
+            side = first_step.get('side', None)
+            if side not in ('buy', 'sell'):
+                # Skip rows with invalid side
+                continue
 
             slippage = None
             if arrival_price and order_vwap:
@@ -1045,28 +1055,25 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
     else:
         ax_top.text(0.5, 0.5, 'No date data to plot', ha='center', va='center', transform=ax_top.transAxes)
 
-    # Boxplot row: overall arrival slippage per model (bps)
-    box_data = []
-    box_labels = []
-    for model_name in model_names:
+    # Model-wise line plot with standard error bands (replace boxplot)
+    ax_box.set_title("Arrival Slippage by Model (Mean ± SE, bps)")
+    ax_box.set_ylabel("Arrival Slippage (bps)")
+    ax_box.grid(True, alpha=0.3)
+    x = np.arange(len(model_names), dtype=float)
+    for i, model_name in enumerate(model_names):
         df = model_to_df[model_name]
         if df.empty or 'slippage' not in df.columns:
             continue
-        vals = (df['slippage'].dropna().values * 10000.0)
-        if vals.size == 0:
+        s = df['slippage'].dropna().values * 10000.0
+        if s.size == 0:
             continue
-        box_data.append(vals)
-        box_labels.append((model_name or "")[0:25])
-    if box_data:
-        bp = ax_box.boxplot(box_data, patch_artist=True, labels=box_labels)
-        for i, patch in enumerate(bp['boxes']):
-            patch.set_facecolor(color_cycle[i % len(color_cycle)])
-            patch.set_alpha(0.25)
-        ax_box.set_title("Arrival Slippage Distribution (bps) by Model")
-        ax_box.set_ylabel("Arrival Slippage (bps)")
-        ax_box.grid(True, alpha=0.3)
-    else:
-        ax_box.text(0.5, 0.5, 'No slippage data for boxplot', ha='center', va='center', transform=ax_box.transAxes)
+        mean = float(np.mean(s))
+        se = float(np.std(s, ddof=1) / np.sqrt(s.size)) if s.size > 1 else 0.0
+        ax_box.plot([x[i]], [mean], marker='o', color=color_cycle[i % len(color_cycle)], label=(model_name or "")[0:25])
+        ax_box.fill_between([x[i]-0.25, x[i]+0.25], [mean-se, mean-se], [mean+se, mean+se], color=color_cycle[i % len(color_cycle)], alpha=0.2)
+    ax_box.set_xticks(np.arange(len(model_names)))
+    ax_box.set_xticklabels([(m or "")[0:25] for m in model_names], rotation=0)
+    ax_box.legend(loc='best')
 
     # Remaining 2x2 factors below
     n_plots = min(4, len(factors))
@@ -1211,7 +1218,9 @@ def _clean_orders_for_analysis(orders_dict, trim=0.01):
             last = order_info[-1]
             arrival = first.get('arrival_price', None)
             vwap = last.get('order_vwap', None)
-            side = first.get('side', 'buy')
+            side = first.get('side', None)
+            if side not in ('buy', 'sell'):
+                continue
             if arrival in (None, 0, np.nan) or vwap in (None, np.nan):
                 continue
             slippage = (vwap - arrival) / arrival
@@ -1294,7 +1303,7 @@ def _clean_orders_for_analysis(orders_dict, trim=0.01):
                     if (last_mid is not None) and (arrival not in (None, 0, np.nan)):
                         raw = (last_mid - arrival) / arrival
                         intr = raw if side == 'buy' else -raw
-                    logger.warning(
+                    logger.info(
                         "Trimming slippage outlier: model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f bounds=[%.1f, %.1f]",
                         model_name,
                         first.get('ticker', 'NA'),
@@ -1367,7 +1376,8 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
     bin_centers = (bins[:-1] + bins[1:]) * 0.5
 
     def collect_actions_by_bin(orders):
-        per_bin = [[] for _ in range(num_bins)]
+        per_bin_actions = [[] for _ in range(num_bins)]
+        per_bin_returns = [[] for _ in range(num_bins)]
         for order_info in orders:
             if order_info is None:
                 continue
@@ -1405,11 +1415,21 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
                     idx = 0
                 if idx >= num_bins:
                     idx = num_bins - 1
-                per_bin[idx].append(action_pct)
-        return per_bin
+                per_bin_actions[idx].append(action_pct)
+                # side-adjusted return per step relative to arrival (per-order first-step arrival/side)
+                arrival = first.get('arrival_price', None)
+                side = first.get('side', None)
+                if side not in ('buy', 'sell'):
+                    continue
+                mid = step.get('mid_price', None)
+                if arrival not in (None, 0, np.nan) and mid not in (None, np.nan):
+                    raw = (float(mid) - float(arrival)) / float(arrival)
+                    sret = raw if side == 'buy' else -raw
+                    per_bin_returns[idx].append(sret * 10000.0)
+        return per_bin_actions, per_bin_returns
 
-    a_bins = collect_actions_by_bin(orders_dict[model_a])
-    b_bins = collect_actions_by_bin(orders_dict[model_b])
+    a_bins, a_returns = collect_actions_by_bin(orders_dict[model_a])
+    b_bins, b_returns = collect_actions_by_bin(orders_dict[model_b])
 
     # Prepare boxplot inputs: for each bin, two datasets -> positions offset around bin center
     color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [
@@ -1440,6 +1460,8 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
 
     ma, sea, ca = compute_stats(a_bins)
     mb, seb, cb = compute_stats(b_bins)
+    mra, sra, _ = compute_stats(a_returns)
+    mrb, srb, _ = compute_stats(b_returns)
 
     # Helper to compute side-adjusted intra-order return per order
     def side_adjusted_return(order_info):
@@ -1452,7 +1474,9 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
         if arrival in (None, 0, np.nan) or last_mid in (None, np.nan):
             return np.nan
         raw = (last_mid - arrival) / arrival
-        side = first.get('side', 'buy')
+        side = first.get('side', None)
+        if side not in ('buy', 'sell'):
+            return np.nan
         return raw if side == 'buy' else -raw
 
     # Collect returns for tertile split across both models
@@ -1493,11 +1517,13 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
 
     # For a given subset, recompute binned action stats
     def stats_for_subset(subset_a, subset_b):
-        a_binned = collect_actions_by_bin(subset_a)
-        b_binned = collect_actions_by_bin(subset_b)
+        a_binned, a_ret = collect_actions_by_bin(subset_a)
+        b_binned, b_ret = collect_actions_by_bin(subset_b)
         ma_s, sea_s, _ = compute_stats(a_binned)
         mb_s, seb_s, _ = compute_stats(b_binned)
-        return ma_s, sea_s, mb_s, seb_s
+        mra_s, sra_s, _ = compute_stats(a_ret)
+        mrb_s, srb_s, _ = compute_stats(b_ret)
+        return ma_s, sea_s, mb_s, seb_s, mra_s, sra_s, mrb_s, srb_s
 
     la = (model_a or "")[0:25]
     lb = (model_b or "")[0:25]
@@ -1505,7 +1531,7 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
     # Build 4 stacked panels: overall + positive + neutral + negative
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
     panels = [
-        (axes[0], "Actions by Normalized Horizon (Mean ± SE) — Overall", ma, sea, mb, seb),
+        (axes[0], "Actions by Normalized Horizon (Mean ± SE) — Overall", ma, sea, mb, seb, mra, sra, mrb, srb),
         (axes[1], "Positive Side-Adj Return (top tertile)",) + stats_for_subset(
             filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive'),
             filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive')
@@ -1520,7 +1546,7 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
         ),
     ]
 
-    def plot_panel(ax, title, ma_p, sea_p, mb_p, seb_p, subset_a, subset_b):
+    def plot_panel(ax, title, ma_p, sea_p, mb_p, seb_p, ra_p, sra_p, rb_p, srb_p):
         ax.set_title(title)
         ax.set_ylabel("Action (%)")
         # Model A
@@ -1530,18 +1556,13 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
         ax.plot(bin_centers, mb_p, color=color_cycle[1], marker='o', label=lb)
         ax.fill_between(bin_centers, mb_p - seb_p, mb_p + seb_p, color=color_cycle[1], alpha=0.2)
         ax.grid(True, alpha=0.3)
-        # Secondary axis: mean side-adjusted intra-order return (bps) for the subset
+        # Secondary axis: mean side-adjusted intra-order return (bps) per bin
         ax2 = ax.twinx()
-        def mean_return(orders):
-            vals = []
-            for oi in orders:
-                r = side_adjusted_return(oi)
-                if np.isfinite(r):
-                    vals.append(r)
-            return 0.0 if len(vals) == 0 else float(np.mean(vals)) * 10000.0
-        ax2.plot([bin_centers[0], bin_centers[-1]], [mean_return(subset_a)]*2, color=color_cycle[0], linestyle='--', alpha=0.4, label=f"{la} mean ret (bps)")
-        ax2.plot([bin_centers[0], bin_centers[-1]], [mean_return(subset_b)]*2, color=color_cycle[1], linestyle='--', alpha=0.4, label=f"{lb} mean ret (bps)")
-        ax2.set_ylabel("Mean Side-Adj Return (bps)")
+        ax2.plot(bin_centers, ra_p, color=color_cycle[0], linestyle='--', alpha=0.6, label=f"{la} ret (bps)")
+        ax2.fill_between(bin_centers, ra_p - sra_p, ra_p + sra_p, color=color_cycle[0], alpha=0.15)
+        ax2.plot(bin_centers, rb_p, color=color_cycle[1], linestyle='--', alpha=0.6, label=f"{lb} ret (bps)")
+        ax2.fill_between(bin_centers, rb_p - srb_p, rb_p + srb_p, color=color_cycle[1], alpha=0.15)
+        ax2.set_ylabel("Side-Adj Return (bps)")
         try:
             lines1, labels1 = ax.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
@@ -1549,16 +1570,22 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
         except Exception:
             pass
 
-    plot_panel(axes[0], panels[0][1], panels[0][2], panels[0][3], panels[0][4], panels[0][5], orders_dict[model_a], orders_dict[model_b])
-    plot_panel(axes[1], panels[1][1], panels[1][2], panels[1][3], panels[1][4], panels[1][5],
-               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive'),
-               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive'))
-    plot_panel(axes[2], panels[2][1], panels[2][2], panels[2][3], panels[2][4], panels[2][5],
-               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral'),
-               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral'))
-    plot_panel(axes[3], panels[3][1], panels[3][2], panels[3][3], panels[3][4], panels[3][5],
-               filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative'),
-               filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative'))
+    plot_panel(axes[0], panels[0][1], panels[0][2], panels[0][3], panels[0][4], panels[0][5], panels[0][6], panels[0][7], panels[0][8], panels[0][9])
+    # Positive subset
+    pa = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive')
+    pb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive')
+    ma_p, sea_p, mb_p, seb_p, mra_p, sra_p, mrb_p, srb_p = stats_for_subset(pa, pb)
+    plot_panel(axes[1], panels[1][1], ma_p, sea_p, mb_p, seb_p, mra_p, sra_p, mrb_p, srb_p)
+    # Neutral subset
+    na = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral')
+    nb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral')
+    ma_n, sea_n, mb_n, seb_n, mra_n, sra_n, mrb_n, srb_n = stats_for_subset(na, nb)
+    plot_panel(axes[2], panels[2][1], ma_n, sea_n, mb_n, seb_n, mra_n, sra_n, mrb_n, srb_n)
+    # Negative subset
+    ga = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative')
+    gb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative')
+    ma_g, sea_g, mb_g, seb_g, mra_g, sra_g, mrb_g, srb_g = stats_for_subset(ga, gb)
+    plot_panel(axes[3], panels[3][1], ma_g, sea_g, mb_g, seb_g, mra_g, sra_g, mrb_g, srb_g)
 
     axes[-1].set_xlabel("Normalized Horizon")
     for ax in axes:
