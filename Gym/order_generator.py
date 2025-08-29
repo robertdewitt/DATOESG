@@ -464,6 +464,8 @@ class OrderGenerator:
     def _calculate_intra_order_returns(self, orders_df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate intra-order returns for all orders.
+        Positive return reflects a favorable move for the order side
+        (up for buys, down for sells).
         @param orders_df: Orders DataFrame
         @return: Orders DataFrame with intra_order_return calculated
         """
@@ -498,7 +500,10 @@ class OrderGenerator:
                         if bid_start > 0 and ask_start > 0 and bid_end > 0 and ask_end > 0:
                             mid_start = (bid_start + ask_start) / 2
                             mid_end = (bid_end + ask_end) / 2
-                            intra_return = (mid_end - mid_start) / mid_start
+                            raw_return = (mid_end - mid_start) / mid_start
+                            # Side-adjust so positive means favorable move
+                            order_side = str(row.get('side', 'buy')).lower()
+                            intra_return = raw_return if order_side == 'buy' else -raw_return
                             orders_df.loc[idx, 'intra_order_return'] = intra_return
                     except Exception as e:
                         logger.debug(f"Error calculating return for {ticker} order {idx}: {e}")
