@@ -118,7 +118,7 @@ class PropagatorParamLoader:
         )
     
     def _load_params_from_file(self, symbol: str, date_str: str, 
-                              y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Tuple[float, float]:
+                              y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Tuple[float, float, float]:
         """
         Load Y and tau parameters from parquet file.
         
@@ -179,14 +179,25 @@ class PropagatorParamLoader:
             if abs(Y) > 1.0:  # Sanity check for unreasonable Y values
                 logger.warning(f"Large Y value for {symbol} on {date_str} using column {y_column}: {Y}")
             
-            return Y, tau
+            # Extract R^2 using the known column name
+            r2 = np.nan
+            try:
+                if 'mean_r2_best' in df.columns:
+                    r2_val = df['mean_r2_best'][0]
+                    if r2_val is not None and not pd.isna(r2_val):
+                        r2 = float(r2_val)
+            except Exception:
+                r2 = np.nan
+            
+            return Y, tau, r2
             
         except Exception as e:
             logger.error(f"Error loading parameters from {file_path}: {e}")
             raise
     
     def get_params(self, symbol: str, date_input: Union[str, date, datetime], 
-                   fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Tuple[float, float]:
+                   fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best',
+                   include_r2: bool = False) -> Union[Tuple[float, float], Dict[str, float]]:
         """
         Get Y and tau parameters for a specific symbol and date.
         
@@ -208,8 +219,8 @@ class PropagatorParamLoader:
         
         # Try to load exact date
         try:
-            params = self._load_params_from_file(symbol, date_str, y_column, tau_column)
-            return params
+            Y, tau, r2 = self._load_params_from_file(symbol, date_str, y_column, tau_column)
+            return ({'Y': Y, 'tau': tau, 'r2': r2} if include_r2 else (Y, tau))
         
         except FileNotFoundError:
             # Try fallback dates (search backwards)
@@ -220,9 +231,9 @@ class PropagatorParamLoader:
                 fallback_date_str = fallback_date.strftime(self.date_format)
                 
                 try:
-                    params = self._load_params_from_file(symbol, fallback_date_str, y_column, tau_column)
+                    Y, tau, r2 = self._load_params_from_file(symbol, fallback_date_str, y_column, tau_column)
                     logger.info(f"Using fallback date {fallback_date_str} for {symbol} on {date_str}")
-                    return params
+                    return ({'Y': Y, 'tau': tau, 'r2': r2} if include_r2 else (Y, tau))
                 
                 except FileNotFoundError:
                     continue
@@ -234,7 +245,8 @@ class PropagatorParamLoader:
             )
     
     def get_params_batch(self, symbol_date_pairs: List[Tuple[str, Union[str, date, datetime]]], 
-                        fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best') -> Dict[Tuple[str, str], Tuple[float, float]]:
+                        fallback_days: int = 5, y_column: str = 'Y_best', tau_column: str = 'tau_best',
+                        include_r2: bool = False) -> Dict[Tuple[str, str], Union[Tuple[float, float], Dict[str, float]]]:
         """
         Get parameters for multiple (symbol, date) pairs efficiently.
         
@@ -264,7 +276,7 @@ class PropagatorParamLoader:
         for symbol, date_input in symbol_date_pairs:
             try:
                 normalized_date = self._normalize_date(date_input)
-                params = self.get_params(symbol, date_input, fallback_days, y_column, tau_column)
+                params = self.get_params(symbol, date_input, fallback_days, y_column, tau_column, include_r2=include_r2)
                 results[(symbol.upper(), normalized_date)] = params
                 found_count += 1
             

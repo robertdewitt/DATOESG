@@ -153,6 +153,13 @@ class OrderGenerator:
         
         logger.info(f"Propagator parameters loaded in {time.time() - prop_start:.2f}s")
         
+        # Step 6.1: Quality filter — drop orders with bad volatility or low propagator R^2
+        pre_filter_count = len(orders_df)
+        orders_df = self._filter_orders_quality(orders_df)
+        dropped = pre_filter_count - len(orders_df)
+        if dropped > 0:
+            logger.info(f"Quality filter dropped {dropped} orders (kept {len(orders_df)}).")
+        
         # Step 7: Calculate intra-order returns
         logger.info("Calculating intra-order returns...")
         returns_start = time.time()
@@ -166,6 +173,40 @@ class OrderGenerator:
         logger.debug(f"Orders per date distribution:\n{orders_df['date'].value_counts().sort_index()}")
         
         return orders_df
+
+    def _filter_orders_quality(self, orders_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Drop orders that fail basic quality thresholds:
+          - Missing or invalid daily_volatility (<=0) or daily_volatility > 0.5
+          - Propagator R^2 < 0.02 when available
+        Logs each dropped order with details.
+        """
+        if orders_df.empty:
+            return orders_df
+        df = orders_df.copy()
+        # Use daily_volatility; fallback to daily_volatility_lag1 only for logging if dv missing
+        dv = pd.to_numeric(df.get('daily_volatility', np.nan), errors='coerce')
+        bad_vol_mask = (~np.isfinite(dv)) | (dv <= 0) | (dv > 0.5)
+
+        # Flexible R^2 presence: look for 'r2' if populated by propagator loader
+        r2_series = pd.to_numeric(df.get('r2', np.nan), errors='coerce') if ('r2' in df.columns) else np.nan
+        has_r2 = isinstance(r2_series, pd.Series)
+        low_r2_mask = (r2_series < 0.02) if has_r2 else pd.Series(False, index=df.index)
+
+        drop_mask = bad_vol_mask | low_r2_mask
+        if drop_mask.any():
+            to_drop = df[drop_mask]
+            for _, row in to_drop.iterrows():
+                logger.warning(
+                    "Dropping generated order: ticker=%s date=%s reason=%s dv=%s r2=%s",
+                    row.get('ticker', 'NA'),
+                    row.get('date', 'NA'),
+                    ("bad_vol" if ((not np.isfinite(row.get('daily_volatility', np.nan))) or (row.get('daily_volatility', 0) <= 0) or (row.get('daily_volatility', 1) > 0.5)) else "low_r2"),
+                    row.get('daily_volatility', None),
+                    row.get('r2', None)
+                )
+            df = df[~drop_mask].reset_index(drop=True)
+        return df
 
 
     def _build_availability_matrix(self, stocks: List[str], dates: List[date]) -> np.ndarray:
@@ -406,17 +447,37 @@ class OrderGenerator:
                 symbol_date_pairs,
                 fallback_days=5,
                 y_column=self.y_column,
-                tau_column=self.tau_column
+                tau_column=self.tau_column,
+                include_r2=True
             )
 
             # Convert to DataFrame for efficient merging
             params_data = []
-            for (symbol, date), (Y, tau) in params_dict.items():
+            for (symbol, date), vals in params_dict.items():
+                Y = np.nan
+                tau = np.nan
+                r2 = np.nan
+                try:
+                    if isinstance(vals, dict):
+                        Y = vals.get(self.y_column, vals.get('Y', np.nan))
+                        tau = vals.get(self.tau_column, vals.get('tau', np.nan))
+                        r2 = vals.get('r2', np.nan)
+                    else:
+                        # tuple or list
+                        if len(vals) >= 1:
+                            Y = vals[0]
+                        if len(vals) >= 2:
+                            tau = vals[1]
+                        if len(vals) >= 3:
+                            r2 = vals[2]
+                except Exception:
+                    pass
                 params_data.append({
                     'ticker': symbol,
                     'date': date,
                     'Y': Y,
-                    'tau': tau
+                    'tau': tau,
+                    'r2': r2
                 })
             
             if params_data:
@@ -427,7 +488,7 @@ class OrderGenerator:
 
                 # Vectorized merge - much faster than apply()
                 orders_df = orders_df.merge(
-                    params_df[['ticker', 'date', 'Y', 'tau']], 
+                    params_df[['ticker', 'date', 'Y', 'tau', 'r2']], 
                     on=['ticker', 'date'], 
                     how='left'
                 )
