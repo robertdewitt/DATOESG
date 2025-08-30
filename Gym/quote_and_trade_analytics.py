@@ -42,6 +42,52 @@ class QuoteAndTradeAnalytics:
         if load_immediately:
             self.load_analytics()
     
+
+    def compute_global_quantile_transform(self, column: str) -> dict:
+        """
+        Compute quantile transformation parameters for a column.
+        Returns dict with 'values' and 'quantiles' for later transformation.
+        """
+        import numpy as np
+        
+        vals = []
+        for df in self.analytics_data.values():
+            if column in df.columns:
+                arr = df[column].dropna().to_numpy()
+                if arr.size:
+                    vals.append(arr)
+        
+        if not vals:
+            return None
+        
+        all_values = np.concatenate(vals)
+        if all_values.size == 0:
+            return None
+        
+        # Sort values and compute quantiles (0-1 range)
+        sorted_vals = np.sort(all_values)
+        quantiles = np.linspace(0, 1, len(sorted_vals))
+        
+        return {'values': sorted_vals, 'quantiles': quantiles}
+
+    def apply_quantile_transform(self, series, transform_dict):
+        """
+        Apply quantile transformation using precomputed parameters.
+        """
+        import numpy as np
+        
+        if transform_dict is None:
+            return pd.Series(0.0, index=series.index)
+        
+        # Use numpy's interp for quantile mapping
+        # This handles ties by linear interpolation
+        result = np.interp(series.fillna(0), 
+                        transform_dict['values'], 
+                        transform_dict['quantiles'])
+        
+        return pd.Series(result, index=series.index).clip(0, 1)
+
+
     def load_analytics(self) -> None:
         """
         Load analytics data from parquet files.
@@ -109,33 +155,22 @@ class QuoteAndTradeAnalytics:
 
         if loaded_count == 0:
             return
-
-        # -------- Compute global bounds once (after all symbols loaded) --------
-        adv_min, adv_max = self.global_minmax('adv_21_days')
-        vol_min, vol_max = self.global_minmax('daily_volatility_lag1')
-
-        adv_ok = (np.isfinite(adv_min) and np.isfinite(adv_max) and adv_max > adv_min and adv_min >= 0.0 and adv_max > 0.0)
-        vol_ok = (np.isfinite(vol_min) and np.isfinite(vol_max) and vol_max > vol_min and vol_min >= 0.0 and vol_max > 0.0)
-
-        if not adv_ok:
-            logger.warning("ADV normalization skipped: invalid global bounds (min=%s, max=%s)", adv_min, adv_max)
-        if not vol_ok:
-            logger.warning("VOL normalization skipped: invalid global bounds (min=%s, max=%s)", vol_min, vol_max)
+        
+        adv_transform = self.compute_global_quantile_transform('adv_21_days')
+        vol_transform = self.compute_global_quantile_transform('daily_volatility_lag1')
 
         # -------- Pass 2: attach normalized columns using global bounds --------
         for symbol, df in self.analytics_data.items():
-            if adv_ok and 'adv_21_days' in df.columns:
-                denom = adv_max - adv_min
-                df['adv_21_days_norm'] = ((df['adv_21_days'] - adv_min) / denom).clip(lower=0.0, upper=1.0).fillna(0.0)
+            if 'adv_21_days' in df.columns:
+                df['adv_21_days_norm'] = self.apply_quantile_transform(df['adv_21_days'], adv_transform)
             else:
                 df['adv_21_days_norm'] = 0.0
 
-            if vol_ok and 'daily_volatility_lag1' in df.columns:
-                denom = vol_max - vol_min
-                df['vol_lag1_norm'] = ((df['daily_volatility_lag1'] - vol_min) / denom).clip(lower=0.0, upper=1.0).fillna(0.0)
+            if 'daily_volatility_lag1' in df.columns:
+                df['vol_lag1_norm'] = self.apply_quantile_transform(df['daily_volatility_lag1'], vol_transform)
             else:
                 df['vol_lag1_norm'] = 0.0
-
+                
         if not self.available_columns:
             first_df = next(iter(self.analytics_data.values()))
             self.available_columns = [col for col in first_df.columns if col != 'date']
@@ -143,7 +178,7 @@ class QuoteAndTradeAnalytics:
         if self.available_columns:
             logger.info(f"Available analytics columns: {self.available_columns}")
 
-        
+    
 
     def get_analytics_for_symbol_date(self, symbol: str, target_date: Union[str, date, datetime]) -> Optional[Dict]:
         """
@@ -181,7 +216,8 @@ class QuoteAndTradeAnalytics:
             'daily_volatility': row.get('daily_volatility', 0),
             'daily_volatility_lag1': row.get('daily_volatility_lag1', 0),
             'daily_volatility_5d': row.get('daily_volatility_5d', 0),
-            'adv_21_days_norm': row.get('adv_21_days_norm', 0)
+            'adv_21_days_norm': row.get('adv_21_days_norm', 0),
+            'vol_lag1_norm': row.get('vol_lag1_norm', 0)
         }
     
 
