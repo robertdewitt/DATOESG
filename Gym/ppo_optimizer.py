@@ -8,9 +8,19 @@ import logging
 import time
 import os
 import torch
+import math
+
 
 class LrCheck(BaseCallback):
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # required abstract method; do nothing each env step
+        return True
+
     def _on_rollout_end(self) -> bool:
+        # logs once per rollout/update
         lr = self.model.policy.optimizer.param_groups[0]["lr"]
         self.logger.record("debug/optimizer_lr", float(lr))
         return True
@@ -55,7 +65,101 @@ class ExecFeaturesOptimized(BaseFeaturesExtractor):
         return self.trunk(x)
 
 
-def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_extractor=None, ppo_kwargs=None, device="cpu", ppo_gamma=0.999):
+
+class ExecCNNExtractor(BaseFeaturesExtractor):
+    """
+    CNN that accepts single-step vectors (C,), stacks (C,K) or (K,C).
+    - Uses SiLU activations but initializes with ReLU gain (works on all torch versions).
+    - Pools adaptively so T=1 is safe (no kernel=2 crash).
+    """
+    def __init__(self, observation_space, features_dim=256):
+        super().__init__(observation_space, features_dim)
+        self._features_dim = features_dim
+        self._lazy_first = True  # rebind first conv in forward() with true C
+
+        def block(c_in, c_out, k=5, s=1, p=None, d=1):
+            if p is None:
+                p = d * (k - 1) // 2
+            seq = nn.Sequential(
+                nn.Conv1d(c_in, c_out, kernel_size=k, stride=s, padding=p, dilation=d, bias=True),
+                nn.SiLU(),
+                nn.GroupNorm(1, c_out),
+            )
+            # init conv with ReLU gain (good proxy for SiLU)
+            conv = seq[0]
+            nn.init.kaiming_uniform_(conv.weight, nonlinearity="relu")
+            if conv.bias is not None:
+                fan_in = conv.weight.shape[1] * conv.kernel_size[0]
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(conv.bias, -bound, bound)
+            return seq
+
+        # placeholder in_channels; will be rebound lazily
+        self.stage1 = block(8, 64, k=5)
+        self.stage2 = block(64, 64, k=5)
+        self.stage3 = block(64, 128, k=5, d=2)  # dilation widens temporal field
+
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, features_dim),
+            nn.SiLU(),
+        )
+        # init head
+        lin = self.head[1]
+        nn.init.xavier_uniform_(lin.weight, gain=nn.init.calculate_gain("relu"))
+        if lin.bias is not None:
+            nn.init.zeros_(lin.bias)
+
+    @staticmethod
+    def _to_bct(x: torch.Tensor) -> torch.Tensor:
+        # Accept [B,C], [B,C,T], [B,T,C] -> return [B,C,T]
+        if x.dim() == 2:              # [B,C] -> [B,C,1]
+            x = x.unsqueeze(-1)
+        elif x.shape[1] > x.shape[-1]:  # likely [B, T, C]
+            x = x.permute(0, 2, 1).contiguous()
+        return x  # [B,C,T]
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = self._to_bct(obs)
+        B, C, T = x.shape
+
+        # rebind first conv in stage1 with true C
+        if self._lazy_first:
+            conv = self.stage1[0]
+            if conv.in_channels != C:
+                new0 = nn.Conv1d(C, conv.out_channels,
+                                 kernel_size=conv.kernel_size[0],
+                                 stride=conv.stride[0],
+                                 padding=conv.padding[0],
+                                 dilation=conv.dilation[0],
+                                 bias=True)
+                nn.init.kaiming_uniform_(new0.weight, nonlinearity="relu")
+                if new0.bias is not None:
+                    fan_in = new0.weight.shape[1] * new0.kernel_size[0]
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(new0.bias, -bound, bound)
+                self.stage1[0] = new0
+            self._lazy_first = False
+
+        # Block 1
+        x = self.stage1(x)
+        # Adaptive pool: when T==1, this becomes identity (ks=1, stride=1)
+        pool_ks = max(1, x.shape[-1] // 2)
+        x = F.max_pool1d(x, kernel_size=pool_ks, stride=pool_ks)
+
+        # Blocks 2–3
+        x = self.stage2(x)
+        x = self.stage3(x)
+
+        # Global pooling (safe even if T==1)
+        x = F.adaptive_avg_pool1d(x, 1)   # [B,128,1]
+        x = self.head(x)                  # [B,features_dim]
+        return x
+
+
+
+
+def create_optimized_ppo_model(train_env,  model_name, model=None, num_envs=None, feature_extractor=ExecFeaturesOptimized, ppo_kwargs=None, device="cpu", ppo_gamma=0.999, n_steps=2048):
     """
     Create an optimized PPO model with performance-tuned hyperparameters.
     
@@ -84,13 +188,6 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
     if num_envs is None:
         num_envs = train_env.num_envs
     
-    if feature_extractor is None:
-        feature_extractor = ExecFeaturesOptimized
-    
-    # OPTIMIZATION 1: Optimal n_steps and batch_size
-    # Rule: n_steps * num_envs should be divisible by batch_size
-    # Larger batches = better vectorization
-    n_steps = 2048  # Reduced from 8192*4 for faster updates
     
     # Ensure batch_size divides evenly into total samples
     total_samples = n_steps * num_envs
@@ -118,47 +215,63 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
     # OPTIMIZATION 3: Optimized policy network
     if ppo_kwargs is None:
         ppo_kwargs = dict(
-            features_extractor_class=ExecFeaturesOptimized,
+            features_extractor_class=feature_extractor,
             features_extractor_kwargs=dict(features_dim=256),
-            net_arch=dict(pi=[256], vf=[256]),  # Smaller networks train faster
-            activation_fn=nn.ReLU,
-            ortho_init=False,  # Faster initialization
-            share_features_extractor=True,  # Share features between actor and critic
-            normalize_images=False,  # We handle normalization in the extractor
+            net_arch=dict(pi=[256,256,128], vf=[256,256,128]),
+            activation_fn=nn.Tanh,
+            ortho_init=False,
+            share_features_extractor=True,
+            normalize_images=False,
         )
+    else:
+        ppo_kwargs = ppo_kwargs.copy()
+        ppo_kwargs.setdefault("features_extractor_class", feature_extractor)
+        ppo_kwargs.setdefault("features_extractor_kwargs", dict(features_dim=256))
+        ppo_kwargs.setdefault("ortho_init", False)
+        ppo_kwargs.setdefault("share_features_extractor", True)
+        ppo_kwargs.setdefault("normalize_images", False)
     
     # OPTIMIZATION 4: Learning rate schedule
-    def make_lr_schedule(base_lr):
+    def make_linear_schedule(base_lr):
         def lr_schedule(progress_remaining: float) -> float:
-            return base_lr * progress_remaining     
+            return base_lr * progress_remaining
         return lr_schedule
 
-    # OPTIMIZATION 5: PPO hyperparameters
-    model = PPO(
-        policy="MlpPolicy",
-        env=train_env,
-        device=device,  
-        n_steps=n_steps,
-        batch_size=2048,
-        learning_rate=make_lr_schedule(3e-4),  
-        n_epochs=n_epochs,
-        clip_range=0.2,  # Slightly higher for faster learning
-        clip_range_vf=0.2,  # No value function clipping (faster)
-        gae_lambda=0.95,
-        vf_coef=0.5,
-        max_grad_norm=0.5,  # Slightly higher for stability
-        gamma=ppo_gamma,  # Slightly lower for faster convergence
-        verbose=1,
-        tensorboard_log=f'./tensorboard_logs/{full_model_name}',
-        policy_kwargs=ppo_kwargs,
-        # Additional optimizations
-        use_sde=False,  # Don't use state-dependent exploration (slower)
-        sde_sample_freq=-1,
-        target_kl=0.01, 
-        ent_coef=0.02,
-        stats_window_size=100,  # Smaller window for faster stats computation
-    )
+    if model is None:
+
+        # OPTIMIZATION 5: PPO hyperparameters
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            device=device,  
+            n_steps=n_steps,
+            batch_size=batch_size,
+            learning_rate=make_linear_schedule(3e-4), 
+            n_epochs=n_epochs,
+            clip_range=make_linear_schedule(0.18),
+            clip_range_vf=None,
+            gae_lambda=0.95,
+            vf_coef=0.55,
+            max_grad_norm=0.5,
+            gamma=ppo_gamma,
+            verbose=1,
+            tensorboard_log=f'./tensorboard_logs/{full_model_name}',
+            policy_kwargs=ppo_kwargs,
+            # Additional optimizations
+            use_sde=False,  # Don't use state-dependent exploration (slower)
+            sde_sample_freq=-1,
+            target_kl=0.02, 
+            ent_coef=0.006,
+            stats_window_size=100,  # Smaller window for faster stats computation
+        )
     
+
+    batch_side = model.batch_size
+    n_steps = model.n_steps
+    n_epochs = model.n_epochs
+    total_samples = n_steps * num_envs
+
+
     logging.info(f"\nOptimized Training Configuration for {full_model_name}:")
     logging.info(f"  - Parallel environments: {num_envs}")
     logging.info(f"  - Steps per rollout: {n_steps}")
@@ -170,7 +283,7 @@ def create_optimized_ppo_model(train_env, model_name, num_envs=None, feature_ext
     
     return model, n_steps, batch_size, full_model_name
 
-def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callbacks=None, 
+def train_ppo_fast(train_env, model_name, num_train_steps, model=None, mp_vec=None, callbacks=None, 
                    feature_extractor=None, ppo_kwargs=None, device="cpu", ppo_gamma=0.999):
     """
     Optimized training function with all performance improvements.
@@ -198,10 +311,20 @@ def train_ppo_fast(train_env, model_name, num_train_steps, mp_vec=None, callback
     start_time = time.time()
     
     # Add callback to check optimizer lr
-    #callbacks = [LrCheck()] + (callbacks or [])
+    callbacks = (callbacks or [])
+    callbacks = [LrCheck()] + callbacks
     
     # Create optimized model
-    model, n_steps, batch_size, full_model_name = create_optimized_ppo_model(train_env, model_name)
+    model, n_steps, batch_size, full_model_name = create_optimized_ppo_model(
+        train_env,
+        model_name,
+        num_envs=train_env.num_envs,
+        model=model,
+        feature_extractor=feature_extractor,
+        ppo_kwargs=ppo_kwargs,
+        device=device,
+        ppo_gamma=ppo_gamma,
+    )
     print("optimizer lr at init:", model.policy.optimizer.param_groups[0]["lr"])
 
     

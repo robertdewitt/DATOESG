@@ -180,7 +180,8 @@ class QuoteAndTradeAnalytics:
             'vwap': row.get('vwap', 0),
             'daily_volatility': row.get('daily_volatility', 0),
             'daily_volatility_lag1': row.get('daily_volatility_lag1', 0),
-            'daily_volatility_5d': row.get('daily_volatility_5d', 0)
+            'daily_volatility_5d': row.get('daily_volatility_5d', 0),
+            'adv_21_days_norm': row.get('adv_21_days_norm', 0)
         }
     
 
