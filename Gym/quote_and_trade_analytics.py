@@ -28,9 +28,10 @@ class QuoteAndTradeAnalytics:
                  load_immediately: bool = True):
         """
         Initialize the analytics class.
-        @param analytics_path: Path to the analytics parquet files
-        @param symbols: Optional list of symbols to load (if None, loads all available)
-        @param load_immediately: Whether to load analytics data immediately
+        Args:
+            analytics_path: Path to the analytics parquet files
+            symbols: Optional list of symbols to load (if None, loads all available)
+            load_immediately: Whether to load analytics data immediately
         """
         self.analytics_path = analytics_path
         self.target_symbols = symbols
@@ -95,11 +96,7 @@ class QuoteAndTradeAnalytics:
                             'end': combined_df['date'].max(),
                             'count': len(combined_df)
                         }
-                        
-                        # Store available columns (from first successful load)
-                        if not self.available_columns:
-                            self.available_columns = [col for col in combined_df.columns if col != 'date']
-                        
+                                                
                         logger.debug(f"Loaded analytics for {symbol}: {len(combined_df)} records "
                                    f"from {combined_df['date'].min().date()} to {combined_df['date'].max().date()}")
                         
@@ -107,16 +104,56 @@ class QuoteAndTradeAnalytics:
             logger.error(f"Error loading analytics: {e}")
             
         logger.info(f"Successfully loaded analytics for {loaded_count} symbols")
+
+        logger.info(f"Normalizing ADV and volatility...")
+
+        if loaded_count == 0:
+            return
+
+        # -------- Compute global bounds once (after all symbols loaded) --------
+        adv_min, adv_max = self.global_minmax('adv_21_days')
+        vol_min, vol_max = self.global_minmax('daily_volatility_lag1')
+
+        adv_ok = (np.isfinite(adv_min) and np.isfinite(adv_max) and adv_max > adv_min and adv_min >= 0.0 and adv_max > 0.0)
+        vol_ok = (np.isfinite(vol_min) and np.isfinite(vol_max) and vol_max > vol_min and vol_min >= 0.0 and vol_max > 0.0)
+
+        if not adv_ok:
+            logger.warning("ADV normalization skipped: invalid global bounds (min=%s, max=%s)", adv_min, adv_max)
+        if not vol_ok:
+            logger.warning("VOL normalization skipped: invalid global bounds (min=%s, max=%s)", vol_min, vol_max)
+
+        # -------- Pass 2: attach normalized columns using global bounds --------
+        for symbol, df in self.analytics_data.items():
+            if adv_ok and 'adv_21_days' in df.columns:
+                denom = adv_max - adv_min
+                df['adv_21_days_norm'] = ((df['adv_21_days'] - adv_min) / denom).clip(lower=0.0, upper=1.0).fillna(0.0)
+            else:
+                df['adv_21_days_norm'] = 0.0
+
+            if vol_ok and 'daily_volatility_lag1' in df.columns:
+                denom = vol_max - vol_min
+                df['vol_lag1_norm'] = ((df['daily_volatility_lag1'] - vol_min) / denom).clip(lower=0.0, upper=1.0).fillna(0.0)
+            else:
+                df['vol_lag1_norm'] = 0.0
+
+        if not self.available_columns:
+            first_df = next(iter(self.analytics_data.values()))
+            self.available_columns = [col for col in first_df.columns if col != 'date']
+
         if self.available_columns:
             logger.info(f"Available analytics columns: {self.available_columns}")
-    
+
+        
 
     def get_analytics_for_symbol_date(self, symbol: str, target_date: Union[str, date, datetime]) -> Optional[Dict]:
         """
         Get analytics for a specific symbol and date.
-        @param symbol: Stock symbol
-        @param target_date: Date to get analytics for
-        @return: Dictionary with analytics values or None if not found
+        Args:
+            symbol: Stock symbol
+            target_date: Date to get analytics for
+
+        Returns:
+            Dictionary with analytics values or None if not found
         """
         if symbol not in self.analytics_data:
             return None
@@ -150,9 +187,12 @@ class QuoteAndTradeAnalytics:
     def get_adv_for_symbol_date(self, symbol: str, target_date: Union[str, date, datetime]) -> float:
         """
         Get adv_21_days for a specific symbol and date.
-        @param symbol: Stock symbol
-        @param target_date: Date to get adv_21_days for
-        @return: adv_21_days value for that date or 0 if not found
+        Args:
+            symbol: Stock symbol
+            target_date: Date to get adv_21_days for
+
+        Returns:
+            adv_21_days value for that date or 0 if not found
         """
         analytics = self.get_analytics_for_symbol_date(symbol, target_date)
         if analytics:
@@ -163,8 +203,11 @@ class QuoteAndTradeAnalytics:
     def has_analytics_for_symbol(self, symbol: str) -> bool:
         """
         Check if analytics are available for a symbol.
-        @param symbol: Stock symbol
-        @return: True if analytics are available
+        Args:
+            symbol: Stock symbol
+
+        Returns:
+            True if analytics are available
         """
         return symbol in self.analytics_data
     
@@ -172,7 +215,9 @@ class QuoteAndTradeAnalytics:
     def has_data(self) -> bool:
         """
         Check if analytics data is available.
-        @return: True if analytics data is available
+
+        Returns:
+            True if analytics data is available, False otherwise
         """
         return len(self.analytics_data) > 0
 
@@ -180,8 +225,12 @@ class QuoteAndTradeAnalytics:
     def get_analytics_bulk(self, symbol_date_pairs: List[tuple]) -> Dict[tuple, Dict]:
         """
         Bulk load analytics for multiple symbol-date pairs.
-        @param symbol_date_pairs: List of (symbol, date) tuples
-        @return: Dictionary mapping (symbol, date) to analytics dict
+
+        Args:
+            symbol_date_pairs: List of (symbol, date) tuples
+
+        Returns:
+            Dictionary mapping (symbol, date) to analytics dict
         """
         result = {}
     
@@ -197,9 +246,13 @@ class QuoteAndTradeAnalytics:
         """
         Get ADV matrix for a list of stocks and dates.
         Optimized to minimize repeated date conversions.
-        @param stocks: List of stock symbols
-        @param dates: List of dates
-        @return: ADV matrix
+
+        Args:
+            stocks: List of stock symbols
+            dates: List of dates
+
+        Returns:
+            ADV matrix
         """
         if not self.has_data():
             logger.warning("No analytics data available")
@@ -237,7 +290,34 @@ class QuoteAndTradeAnalytics:
                     adv_matrix[i, j] = analytics_df[date_mask].iloc[0].get('adv_21_days', 0)
     
         return adv_matrix       
+
     
+    def global_minmax(self, column: str):
+        """
+        Return (min, max) over all loaded analytics for a given column.
+
+        Args:
+            column: The column to get the minmax for
+
+        Returns:
+            (min, max) for the column
+        """
+        import numpy as np
+        vals = []
+        for df in self.analytics_data.values():
+            if column in df.columns:
+                arr = df[column].to_numpy()
+                if arr.size:
+                    vals.append(arr[np.isfinite(arr)])
+        if not vals:
+            return (0.0, 1.0)  # sensible fallback
+        allv = np.concatenate(vals)
+        if allv.size == 0:
+            return (0.0, 1.0)
+        mn, mx = float(np.nanmin(allv)), float(np.nanmax(allv))
+        if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+            return (0.0, 1.0)
+        return (mn, mx)
 
     def __len__(self) -> int:
         """

@@ -481,14 +481,16 @@ class OrderGenerator:
                 'daily_volatility': 'daily_volatility',
                 'daily_volatility_lag1': 'daily_volatility_lag1',
                 'daily_volatility_5d': 'daily_volatility_5d',
-                'daily_vwap': 'vwap'
+                'daily_vwap': 'vwap',
+                'liq_norm': 'adv_21_days_norm',
+                'vol_norm': 'vol_lag1_norm'
             }
             
             for df_col, analytics_col in analytics_cols.items():
                 orders_df[df_col] = orders_df.apply(
                     lambda row: get_analytics_value(row, analytics_col), axis=1
                 )
-        
+
         return orders_df
 
     def _load_propagator_params(self, orders_df: pd.DataFrame) -> pd.DataFrame:

@@ -7,7 +7,8 @@ from matplotlib.ticker import MaxNLocator
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
-
+# set log level to warning
+logger.setLevel(logging.WARNING)
 
 # Consistent, colorblind-friendly palette
 COLOR = {
@@ -533,8 +534,14 @@ def create_execution_summary_table(orders_dict, trim=0):
             first_step = order_info[0]
             last_step = order_info[-1]
             
-            # Compute order notional (for weighting and logging)
-            notional = first_step['order_qty'] * last_step['order_vwap']
+            # Compute executed notional (for weighting): filled_qty * order_vwap
+            order_qty_val = first_step.get('order_qty', 0)
+            shares_remaining_val = last_step.get('shares_remaining', 0)
+            try:
+                filled_qty = max(0, float(order_qty_val) - float(shares_remaining_val))
+            except Exception:
+                filled_qty = 0.0
+            notional = float(last_step.get('order_vwap', 0.0)) * float(filled_qty)
 
             # Compute slippage (adverse sign) and intra-order return
             arrival_price = first_step.get('arrival_price', 0)
@@ -611,7 +618,8 @@ def create_execution_summary_table(orders_dict, trim=0):
             weighted_return += intra_return * notional
             returns.append(intra_return)
             slippages.append(slippage)
-            slippage_notional_pairs.append((slippage, notional))
+            if notional > 0:
+                slippage_notional_pairs.append((slippage, notional))
             
             # Calculate completion duration ratio  
             # first time when shares_remaining is 0
@@ -1303,7 +1311,7 @@ def _clean_orders_for_analysis(orders_dict, trim=0.01):
                     if (last_mid is not None) and (arrival not in (None, 0, np.nan)):
                         raw = (last_mid - arrival) / arrival
                         intr = raw if side == 'buy' else -raw
-                    logger.info(
+                    logger.debug(
                         "Trimming slippage outlier: model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f bounds=[%.1f, %.1f]",
                         model_name,
                         first.get('ticker', 'NA'),

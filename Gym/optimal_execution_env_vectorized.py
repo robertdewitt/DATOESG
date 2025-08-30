@@ -993,6 +993,8 @@ class VectorizedMultiOrderExecutionEnv(VecEnv):
                 'shares_remaining': self.shares_remaining[i].item(),
                 'order_vwap': self.order_vwap[i].item(),
                 'arrival_price': self.arrival_price[i].item(),
+                'order_qty': int(self.order_qty[i].item()),
+                'side': 'buy' if int(self.side[i].item()) == 1 else 'sell',
                 'immediate_impact_cost': self.immediate_impact_cost[i].item(),
                 'accumulated_impact_cost': self.accumulated_impact_cost[i].item(),
                 'action_percentage': float(self.last_action_fraction[i].item()),

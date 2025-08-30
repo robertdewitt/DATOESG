@@ -4,11 +4,38 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.vec_env import VecNormalize
+import json, importlib
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional, Callable
+
+def _class_path(obj_or_cls):
+    cls = obj_or_cls if isinstance(obj_or_cls, type) else obj_or_cls.__class__
+    return f"{cls.__module__}.{cls.__name__}"
+
+def _import_class(path: str):
+    mod, name = path.rsplit(".", 1)
+    return getattr(importlib.import_module(mod), name)
+
+@dataclass
+class ModelManifest:
+    name: str
+    model_type: str          # "sb3" | "torch_module" | custom
+    class_path: str          # dotted path for torch modules
+    extra: Dict[str, Any]    # arbitrary metadata (e.g., fitness, descriptors)
+    file_stem: str           # base filename without extension
+    version: int = 1
 
 
 # this is a class for storing RL agents so that they can be looped through for training, testing, printing, callbacks to tensorboard,  etc.
 
 class ModelParking:
+    """
+    Unified parking for SB3 models (.zip) AND Torch nn.Module models (.pt + manifest).
+    - Backwards compatible with your old __init__(model_dir=None, cached=False, models=None)
+    - Adds serializer registry for future types (e.g., Mamba actor-critic)
+    """
+
+
     def __init__(self, model_dir=None, cached=False,  models=None):
         """
         Initialize the ModelParking with an optional list of models.

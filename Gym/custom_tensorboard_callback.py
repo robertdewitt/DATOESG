@@ -190,11 +190,19 @@ class EnvironmentStatsCallback(BaseCallback):
                 if 'accumulated_impact' in info:
                     self.logger.record("env/accumulated_impact", info['accumulated_impact'])
                 
-                # Calculate slippage if possible
-                if 'order_vwap' in info and 'arrival_price' in info:
-                    if info['arrival_price'] > 0:
-                        slippage = (info['arrival_price'] - info['order_vwap']) / info['arrival_price']
-                        self.logger.record("env/slippage_bps", slippage * 10000)  # Convert to basis points
+                # Calculate slippage (adverse-positive) if possible
+                if 'order_vwap' in info and 'arrival_price' in info and info['arrival_price'] > 0:
+                    side_val = info.get('side', None)
+                    side_sign = None
+                    if isinstance(side_val, str):
+                        side_sign = 1.0 if side_val.lower() == 'buy' else -1.0 if side_val.lower() == 'sell' else None
+                    elif isinstance(side_val, (int, float)):
+                        side_sign = 1.0 if float(side_val) >= 0 else -1.0
+                    # Fallback: assume buy if side missing (kept for backward compatibility)
+                    if side_sign is None:
+                        side_sign = 1.0
+                    slippage = side_sign * ((info['order_vwap'] - info['arrival_price']) / info['arrival_price'])
+                    self.logger.record("env/slippage_bps", slippage * 10000)  # Convert to basis points
                 
                 # Log action statistics
                 if 'action_percentage' in info:

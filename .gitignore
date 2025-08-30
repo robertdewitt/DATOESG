@@ -1,10 +1,11 @@
-
 # Python cache
 __pycache__/
 *.pyc
 *.pkl
 *.zip
 Gym/._mana_data
+.DS_Store/
+Gym/.DS_Store/
 
 .vscode/
 Gym/.venv/

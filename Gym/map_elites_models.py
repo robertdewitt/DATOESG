@@ -165,6 +165,9 @@ class EliteEntry:
     smoothness: float
     path: Optional[str] = None  # filled when saved to disk
 
+
+
+
 def archive_to_matrix(archive) -> Tuple[np.ndarray, np.ndarray]:
     """Return (fitness_grid, mask) with NaN where empty."""
     H, W = len(archive.grid), len(archive.grid[0])
