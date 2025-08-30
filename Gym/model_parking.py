@@ -8,6 +8,9 @@ import json, importlib
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Callable
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
 def _class_path(obj_or_cls):
     cls = obj_or_cls if isinstance(obj_or_cls, type) else obj_or_cls.__class__
     return f"{cls.__module__}.{cls.__name__}"
@@ -36,7 +39,7 @@ class ModelParking:
     """
 
 
-    def __init__(self, model_dir=None, cached=False,  models=None):
+    def __init__(self, model_dir=None, cached=False,  models=None, env=None):
         """
         Initialize the ModelParking with an optional list of models.
         @param model_dir: Directory to save/load models. Defaults to "models".
@@ -56,6 +59,7 @@ class ModelParking:
                     try:
                         model = PPO.load(model_path, env=env, device="auto", print_system_info=True)
                         logging.debug(f"Model '{model_name}' loaded from cache.")
+                        self.models.append((model_name, model))
                     except Exception as e:
                         logging.error(f"Failed to load model '{model_name}': {e}")
 
