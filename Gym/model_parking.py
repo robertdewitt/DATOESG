@@ -39,7 +39,7 @@ class ModelParking:
     """
 
 
-    def __init__(self, model_dir=None, cached=False,  models=None, env=None):
+    def __init__(self, model_dir=None, cached=False,  models=None, env=None, device="auto"):
         """
         Initialize the ModelParking with an optional list of models.
         @param model_dir: Directory to save/load models. Defaults to "models".
@@ -57,7 +57,7 @@ class ModelParking:
                     model_path = os.path.join(self.model_dir, model_file)
                     # load zip file as model
                     try:
-                        model = PPO.load(model_path, env=env, device="auto", print_system_info=True)
+                        model = PPO.load(model_path, env=env, device=device, print_system_info=True)
                         logging.debug(f"Model '{model_name}' loaded from cache.")
                         self.models.append((model_name, model))
                     except Exception as e:

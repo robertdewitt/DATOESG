@@ -102,8 +102,8 @@ class VWAPBaseline:
         # If we're behind schedule (completion < time progress), trade more aggressively
         deviation = completion_ratio - time_ratio
         
-        # Adjust fraction based on how far behind/ahead we are
-        required_fraction = -deviation * self.correction_factor
+        # Adjust fraction based on how far behind/ahead we are add 5% for frotloading as it tends to backload due to no volume profiles
+        required_fraction = -deviation * self.correction_factor + 0.1
         
         required_fraction = np.clip(required_fraction, -1.0, 1.0)
         action_idx = np.argmin(np.abs(self._action_values - required_fraction))

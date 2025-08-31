@@ -34,6 +34,25 @@ def niche_bins(B_LIQ, B_VOL):
         "loL_hiV": (int(0.15*B_LIQ), int(0.85*B_VOL)),
     }
 
+
+def select_specialist_for_order(archive_lv, order_liq, order_vol, 
+                               liq_edges, vol_edges):
+    """Select the best specialist for a given order's characteristics using quantile bins"""
+    # Use the quantile binning function from your MAP-Elites code
+    liq_bin = value_to_quantile_bin(order_liq, liq_edges)
+    vol_bin = value_to_quantile_bin(order_vol, vol_edges)
+    
+    # No need to clip since value_to_quantile_bin already handles bounds
+    
+    # Get the specialist from that cell
+    cell = archive_lv.grid[liq_bin][vol_bin]
+    if cell:
+        return cell
+    else:
+        # Fallback to best overall
+        return archive_lv.best()
+
+
 def park_cell_elite(archive, tag, ppo_model, mp, model_name_prefix, vecnorm=None):
     """
     Utility function to park a cell of the archive.
@@ -470,3 +489,172 @@ def map_elites_liquidity_volatility_seeded(
 
 
 
+# Enhanced MAP-Elites with progress tracking
+def map_elites_with_tracking(env, ppo_seed, cell2indices, nonempty_cells, orders_df,
+                             B_LIQ, B_VOL, iters, children_per_iter, eval_k, sigma,
+                             device="cpu", vecnorm=None):
+    """Modified MAP-Elites that tracks archive state at each iteration"""
+    
+    archive = LiquidityVolatilityArchive(B_LIQ, B_VOL)
+    archive_snapshots = []  # Store archive state over time
+    
+    seed = VecNormPolicyWrapper(ppo_seed, vecnorm)
+    seed.policy.eval()
+    seed_snap = snapshot_policy(seed.base)
+    
+    def _sample_idxs(i, j, k):
+        L = cell2indices.get((i, j), [])
+        if not L: return []
+        if len(L) >= k:
+            return random.sample(L, k)
+        return [random.choice(L) for _ in range(k)]
+    
+    def capture_archive_state():
+        """Capture current state of archive for visualization"""
+        state = np.full((B_LIQ, B_VOL), np.nan)
+        coverage = 0
+        total_fitness = 0
+        for i in range(B_LIQ):
+            for j in range(B_VOL):
+                cell = archive.grid[i][j]
+                if cell:
+                    state[i, j] = cell["fitness"]
+                    coverage += 1
+                    total_fitness += cell["fitness"]
+        return {
+            'grid': state.copy(),
+            'coverage': coverage,
+            'avg_fitness': total_fitness / coverage if coverage > 0 else 0,
+            'best_fitness': archive.best()["fitness"] if archive.best() else -np.inf
+        }
+    
+    # Seeding phase
+    print(f"  Seeding {len(nonempty_cells)} cells...")
+    for (i, j) in tqdm(nonempty_cells, desc="  Seeding", leave=False):
+        idxs = _sample_idxs(i, j, eval_k)
+        if not idxs: continue
+        
+        seed.load_policy_snapshot(seed_snap, device=device)
+        orders = env.execute_orders_vectorized(
+            seed, idxs, collect_step_info=True, show_progress=False,
+            model_name=f"PPO-seed@{i}-{j}"
+        )
+        fit = _fitness_from_orders(orders)
+        liq = float(orders_df.loc[idxs, "liq_norm"].mean())
+        vol = float(orders_df.loc[idxs, "vol_norm"].mean())
+        archive.insert(i, j, seed_snap, fit, (liq, vol))
+    
+    # Capture initial state after seeding
+    archive_snapshots.append(capture_archive_state())
+    
+    # Illumination loop with progress tracking
+    print(f"  Illumination: {iters} iterations × {children_per_iter} children")
+    for iter_idx in tqdm(range(iters), desc="  Illumination", leave=False):
+        targets = random.choices(nonempty_cells, k=min(children_per_iter, len(nonempty_cells)))
+        
+        improvements = 0
+        for (i, j) in targets:
+            parent_snap = archive.grid[i][j]["snapshot"] if archive.grid[i][j] else seed_snap
+            child_snap = mutate_policy_snapshot(parent_snap, sigma=sigma)
+            
+            idxs = _sample_idxs(i, j, eval_k)
+            if not idxs: continue
+            
+            old_fitness = archive.grid[i][j]["fitness"] if archive.grid[i][j] else -np.inf
+            
+            seed.load_policy_snapshot(child_snap, device=device)
+            orders = env.execute_orders_vectorized(
+                seed, idxs, collect_step_info=True, show_progress=False,
+                model_name=f"child@{i}-{j}"
+            )
+            fit = _fitness_from_orders(orders)
+            
+            if fit > old_fitness:
+                improvements += 1
+                liq = float(orders_df.loc[idxs, "liq_norm"].mean())
+                vol = float(orders_df.loc[idxs, "vol_norm"].mean())
+                archive.insert(i, j, child_snap, fit, (liq, vol))
+        
+        # Track progress every 10 iterations
+        if (iter_idx + 1) % 10 == 0:
+            archive_snapshots.append(capture_archive_state())
+            if (iter_idx + 1) % 20 == 0:
+                state = archive_snapshots[-1]
+                print(f"    Iter {iter_idx+1}: Coverage={state['coverage']}/{B_LIQ*B_VOL}, "
+                      f"Best={state['best_fitness']:.4f}, Avg={state['avg_fitness']:.4f}, "
+                      f"Improvements={improvements}/{len(targets)}")
+    
+    # Capture final state
+    archive_snapshots.append(capture_archive_state())
+    
+    seed.load_policy_snapshot(seed_snap, device=device)
+    return archive, archive_snapshots
+
+
+def map_elites_with_capture(env, ppo_seed, cell2indices, nonempty_cells, orders_df,
+                            B_LIQ, B_VOL, iters=100, children_per_iter=256, eval_k=4, 
+                            sigma=0.015, capture_every=5, vecnorm=None):
+    """MAP-Elites that captures grid states for animation"""
+    archive = LiquidityVolatilityArchive(B_LIQ, B_VOL)
+    grid_history = []
+    
+    # Force CPU for PPO models
+    if hasattr(ppo_seed, 'device'):
+        ppo_seed.device = 'cpu'
+    
+    seed = VecNormPolicyWrapper(ppo_seed, vecnorm)
+    seed.policy.eval()
+    seed_snap = snapshot_policy(seed.base)
+    
+    def _sample_idxs(i, j, k):
+        L = cell2indices.get((i, j), [])
+        if not L: return []
+        return random.sample(L, k) if len(L) >= k else [random.choice(L) for _ in range(k)]
+    
+    def capture_grid():
+        Z = np.full((B_LIQ, B_VOL), np.nan)
+        for i in range(B_LIQ):
+            for j in range(B_VOL):
+                if archive.grid[i][j]:
+                    Z[i,j] = archive.grid[i][j]["fitness"]
+        return Z.copy()
+    
+    # Seeding with progress bar
+    for (i, j) in tqdm(nonempty_cells, desc="  Seeding cells"):
+        idxs = _sample_idxs(i, j, eval_k)
+        if not idxs: continue
+        seed.load_policy_snapshot(seed_snap, device="cpu")
+        orders = env.execute_orders_vectorized(
+            seed, idxs, collect_step_info=True, show_progress=False
+        )
+        fit = _fitness_from_orders(orders)
+        liq = float(orders_df.loc[idxs, "liq_norm"].mean())
+        vol = float(orders_df.loc[idxs, "vol_norm"].mean())
+        archive.insert(i, j, seed_snap, fit, (liq, vol))
+    
+    grid_history.append(capture_grid())
+    
+    # Illumination with progress bar
+    for iter_idx in tqdm(range(iters), desc="  MAP-Elites iterations"):
+        targets = random.choices(nonempty_cells, k=min(children_per_iter, len(nonempty_cells)))
+        for (i, j) in targets:
+            parent_snap = archive.grid[i][j]["snapshot"] if archive.grid[i][j] else seed_snap
+            child_snap = mutate_policy_snapshot(parent_snap, sigma=sigma)
+            
+            idxs = _sample_idxs(i, j, eval_k)
+            if not idxs: continue
+            
+            seed.load_policy_snapshot(child_snap, device="cpu")
+            orders = env.execute_orders_vectorized(
+                seed, idxs, collect_step_info=True, show_progress=False
+            )
+            fit = _fitness_from_orders(orders)
+            liq = float(orders_df.loc[idxs, "liq_norm"].mean())
+            vol = float(orders_df.loc[idxs, "vol_norm"].mean())
+            archive.insert(i, j, child_snap, fit, (liq, vol))
+        
+        if (iter_idx + 1) % capture_every == 0:
+            grid_history.append(capture_grid())
+    
+    seed.load_policy_snapshot(seed_snap, device="cpu")
+    return archive, grid_history
