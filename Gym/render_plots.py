@@ -12,8 +12,9 @@ logger.setLevel(logging.WARNING)
 
 # Consistent, colorblind-friendly palette
 COLOR = {
-    'a': 'tab:blue',                 # primary dataset
-    'b': 'tab:purple',               # secondary dataset (changed from orange)
+    'a': 'tab:blue',                 # primary dataset (train)
+    'b': 'tab:orange',               # secondary dataset (validation)
+    'c': 'tab:purple',               # tertiary dataset (test)
     'fill_price': 'tab:blue',
     'market_vwap_price': 'tab:green',
     'order_vwap_price': 'tab:purple',
@@ -229,15 +230,17 @@ def display_order_info(orders_df, num_orders=3, name="Training"):
     print("========================================")
 
 
-def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', b_name='Test'):
+def plot_order_histograms(a_df, b_df=None, c_df=None, date_col='Datetime', a_name='Train', b_name='Validation', c_name='Test'):
     """
-    Plots histograms of order characteristics comparing train and test distributions.
+    Plots histograms of order characteristics comparing train, validation, and test distributions.
     Args:
-        a_df: DataFrame containing order information for the first dataset.
-        b_df: DataFrame containing order information for the second dataset (optional).
+        a_df: DataFrame containing order information for the first dataset (train).
+        b_df: DataFrame containing order information for the second dataset (validation, optional).
+        c_df: DataFrame containing order information for the third dataset (test, optional).
         date_col: Name of the date column in the dataframes.
         a_name: Name of the first dataset.
         b_name: Name of the second dataset.
+        c_name: Name of the third dataset.
     Returns:
         None (prints the plots)
     """
@@ -256,11 +259,17 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
         b_df = b_df.copy()
         b_low, b_high = np.nanpercentile(b_df['daily_volatility'].dropna(), [1, 99])
         b_df['daily_volatility_trimmed'] = b_df['daily_volatility'].clip(lower=b_low, upper=b_high)
+    if c_df is not None and 'daily_volatility' in c_df.columns:
+        c_df = c_df.copy()
+        c_low, c_high = np.nanpercentile(c_df['daily_volatility'].dropna(), [1, 99])
+        c_df['daily_volatility_trimmed'] = c_df['daily_volatility'].clip(lower=c_low, upper=c_high)
     
     # Order size distribution
     axes[plot_idx].hist(a_df['order_qty'], bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
     if b_df is not None:
         axes[plot_idx].hist(b_df['order_qty'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+    if c_df is not None:
+        axes[plot_idx].hist(c_df['order_qty'], bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
     axes[plot_idx].set_title('Order Size Distribution')
     axes[plot_idx].set_xlabel('Order Size')
     axes[plot_idx].set_ylabel('Frequency')
@@ -271,6 +280,8 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     axes[plot_idx].hist(a_df['time_horizon'], bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
     if b_df is not None:
         axes[plot_idx].hist(b_df['time_horizon'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+    if c_df is not None:
+        axes[plot_idx].hist(c_df['time_horizon'], bins=50, alpha=0.3, label=c_name, color=COLOR['c'])
     axes[plot_idx].set_title('Time Horizon Distribution')
     axes[plot_idx].set_xlabel('Time Horizon (minutes)')
     axes[plot_idx].set_ylabel('Frequency')
@@ -281,6 +292,8 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     axes[plot_idx].hist(a_df['adv_pct'], bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
     if b_df is not None:
         axes[plot_idx].hist(b_df['adv_pct'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+    if c_df is not None:
+        axes[plot_idx].hist(c_df['adv_pct'], bins=50, alpha=0.3, label=c_name, color=COLOR['c'])
     axes[plot_idx].set_title('ADV Percentage Distribution')
     axes[plot_idx].set_xlabel('ADV Percentage')
     axes[plot_idx].set_ylabel('Frequency')
@@ -303,7 +316,14 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
             'daily_volatility_trimmed' if 'daily_volatility_trimmed' in b_df.columns else 'daily_volatility'
         ].apply(list).to_dict()
 
-    all_months = sorted(set(train_daily_vol.keys()) | (set(test_daily_vol.keys()) if b_df is not None else set()))
+    if c_df is not None:
+        c_df['date'] = pd.to_datetime(c_df['date'])
+        c_df['month'] = c_df['date'].dt.to_period('M').dt.to_timestamp()
+        test2_daily_vol = c_df.groupby('month')[
+            'daily_volatility_trimmed' if 'daily_volatility_trimmed' in c_df.columns else 'daily_volatility'
+        ].apply(list).to_dict()
+
+    all_months = sorted(set(train_daily_vol.keys()) | (set(test_daily_vol.keys()) if b_df is not None else set()) | (set(test2_daily_vol.keys()) if c_df is not None else set()))
 
     volatility_data = []
     colors = []
@@ -318,6 +338,11 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
             volatility_data.append(test_daily_vol[month])
             colors.append(COLOR['b'])
             positions.append(i + 0.35)
+
+        if c_df is not None and month in test2_daily_vol:
+            volatility_data.append(test2_daily_vol[month])
+            colors.append(COLOR['c'])
+            positions.append(i + 0.70)
 
     bp1 = axes[plot_idx].boxplot(volatility_data, positions=positions, widths=0.3, patch_artist=True)
 
@@ -350,6 +375,11 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
             axes[plot_idx].hist(b_df['daily_volatility_trimmed'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
         elif hasattr(b_df, 'columns') and 'daily_volatility' in b_df.columns:
             axes[plot_idx].hist(b_df['daily_volatility'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+    if c_df is not None:
+        if hasattr(c_df, 'columns') and 'daily_volatility_trimmed' in c_df.columns:
+            axes[plot_idx].hist(c_df['daily_volatility_trimmed'], bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
+        elif hasattr(c_df, 'columns') and 'daily_volatility' in c_df.columns:
+            axes[plot_idx].hist(c_df['daily_volatility'], bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
     axes[plot_idx].set_title('Daily Volatility Distribution')
     axes[plot_idx].set_xlabel('Daily Volatility')
     axes[plot_idx].set_ylabel('Frequency')
@@ -360,6 +390,8 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     axes[plot_idx].hist(a_df['intra_order_return'], bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
     if b_df is not None:
         axes[plot_idx].hist(b_df['intra_order_return'], bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+    if c_df is not None:
+        axes[plot_idx].hist(c_df['intra_order_return'], bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
     axes[plot_idx].set_title('Intra-order Return Distribution')
     axes[plot_idx].set_xlabel('Return')
     axes[plot_idx].set_ylabel('Frequency')
@@ -370,12 +402,15 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     if 'Y' in a_df.columns:
         y_data_a = a_df['Y'].dropna()
         y_data_b = b_df['Y'].dropna() if b_df is not None and 'Y' in b_df.columns else pd.Series()
+        y_data_c = c_df['Y'].dropna() if c_df is not None and 'Y' in c_df.columns else pd.Series()
         
-        if len(y_data_a) > 0 or len(y_data_b) > 0:
+        if len(y_data_a) > 0 or len(y_data_b) > 0 or len(y_data_c) > 0:
             if len(y_data_a) > 0:
                 axes[plot_idx].hist(y_data_a, bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
             if len(y_data_b) > 0:
                 axes[plot_idx].hist(y_data_b, bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+            if len(y_data_c) > 0:
+                axes[plot_idx].hist(y_data_c, bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
             axes[plot_idx].set_title('Y Values Distribution (Impact Coefficient)')
             axes[plot_idx].set_xlabel('Y Value')
             axes[plot_idx].set_ylabel('Frequency')
@@ -393,12 +428,15 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     if 'tau' in a_df.columns:
         tau_data_a = a_df['tau'].dropna()
         tau_data_b = b_df['tau'].dropna() if b_df is not None and 'tau' in b_df.columns else pd.Series()
+        tau_data_c = c_df['tau'].dropna() if c_df is not None and 'tau' in c_df.columns else pd.Series()
         
-        if len(tau_data_a) > 0 or len(tau_data_b) > 0:
+        if len(tau_data_a) > 0 or len(tau_data_b) > 0 or len(tau_data_c) > 0:
             if len(tau_data_a) > 0:
                 axes[plot_idx].hist(tau_data_a, bins=50, alpha=0.5, label=a_name, color=COLOR['a'])
             if len(tau_data_b) > 0:
                 axes[plot_idx].hist(tau_data_b, bins=50, alpha=0.5, label=b_name, color=COLOR['b'])
+            if len(tau_data_c) > 0:
+                axes[plot_idx].hist(tau_data_c, bins=50, alpha=0.5, label=c_name, color=COLOR['c'])
             axes[plot_idx].set_title('Tau Values Distribution (Decay Rate)')
             axes[plot_idx].set_xlabel('Tau Value')
             axes[plot_idx].set_ylabel('Frequency')
@@ -418,6 +456,9 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     if b_df is not None:
         test_daily_adv_pct = b_df.groupby(b_df['date'].dt.date)['adv_pct'].agg(['mean', 'std', 'count']).to_dict('index')
     
+    if c_df is not None:
+        test2_daily_adv_pct = c_df.groupby(c_df['date'].dt.date)['adv_pct'].agg(['mean', 'std', 'count']).to_dict('index')
+    
     # Prepare data for line plot
     train_dates = []
     train_means = []
@@ -427,10 +468,16 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
     test_means = []
     test_errors = []
     
+    test2_dates = []
+    test2_means = []
+    test2_errors = []
+    
     # Build the unified date set for ADV plot (daily granularity)
     all_adv_dates = set(train_daily_adv_pct.keys())
     if b_df is not None:
         all_adv_dates |= set(test_daily_adv_pct.keys())
+    if c_df is not None:
+        all_adv_dates |= set(test2_daily_adv_pct.keys())
     for date in sorted(all_adv_dates):
         if date in train_daily_adv_pct:
             train_dates.append(date)
@@ -451,6 +498,16 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
             
             test_means.append(mean_val)
             test_errors.append(std_error)
+        
+        if c_df is not None and date in test2_daily_adv_pct:
+            test2_dates.append(date)
+            mean_val = test2_daily_adv_pct[date]['mean'] * 100  # Convert to percentage
+            std_val = test2_daily_adv_pct[date]['std'] * 100 if test2_daily_adv_pct[date]['std'] is not None else 0
+            count_val = test2_daily_adv_pct[date]['count']
+            std_error = std_val / np.sqrt(count_val) if count_val > 0 else 0
+            
+            test2_means.append(mean_val)
+            test2_errors.append(std_error)
     
     # Create line plot with actual dates on x-axis
     if train_dates:
@@ -468,6 +525,14 @@ def plot_order_histograms(a_df, b_df=None, date_col='Datetime', a_name='Train', 
                                    [m - e for m, e in zip(test_means, test_errors)],
                                    [m + e for m, e in zip(test_means, test_errors)],
                                    color=COLOR['b'], alpha=0.2)
+    
+    if c_df is not None and test2_dates:
+        x_test2 = pd.to_datetime(test2_dates)
+        axes[plot_idx].plot(x_test2, test2_means, '^-', color=COLOR['c'], label=c_name, linewidth=2, markersize=4)
+        axes[plot_idx].fill_between(x_test2,
+                                   [m - e for m, e in zip(test2_means, test2_errors)],
+                                   [m + e for m, e in zip(test2_means, test2_errors)],
+                                   color=COLOR['c'], alpha=0.2)
     
     axes[plot_idx].set_title('ADV Percentage by Date (Mean ± Standard Error)')
     axes[plot_idx].set_xlabel('Date')
@@ -562,51 +627,7 @@ def create_execution_summary_table(orders_dict, trim=0):
                 intra_return = 0.0
                 orders_with_no_arrival_price += 1
 
-            # Sigma-based outlier filter (drop if either metric > 3 × sigma)
-            # Determine sigma from analytics-provided daily_volatility; fall back to lag1
-            dv_obj = first_step.get('daily_volatility', None)
-            dv_val = None
-            if dv_obj is not None:
-                try:
-                    dv_val = float(dv_obj)
-                except Exception:
-                    dv_val = None
-            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0):
-                dv1_obj = first_step.get('daily_volatility_lag1', None)
-                if dv1_obj is not None:
-                    try:
-                        dv_val = float(dv1_obj)
-                    except Exception:
-                        dv_val = None
-            if dv_val is not None and dv_val > 0 and dv_val < 2.0:
-                if (abs(slippage) > 3.0 * dv_val) or (abs(intra_return) > 3.0 * dv_val):
-                    logger.warning(
-                        "Dropping outlier order: ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f intra_ret_bps=%.1f sigma=%.4f",
-                        first_step.get('ticker', 'NA'),
-                        first_step.get('date', 'NA'),
-                        first_step.get('side', 'NA'),
-                        first_step.get('order_qty', 'NA'),
-                        first_step.get('time_horizon', 'NA'),
-                        slippage * 10000.0,
-                        intra_return * 10000.0,
-                        dv_val,
-                    )
-                    continue
-
-            else:
-                logger.warning(
-                    "Dropping order due to no daily volatility: ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
-                    first_step.get('ticker', 'NA'),
-                    first_step.get('date', 'NA'),
-                    first_step.get('side', 'NA'),
-                    first_step.get('order_qty', 'NA'),
-                    first_step.get('time_horizon', 'NA'),
-                    f"{slippage * 10000.0:.1f}",
-                    f"{intra_return * 10000.0:.1f}",
-                    "NA" if dv_val is None else f"{dv_val:.4f}",
-                )
-
-            # Accumulate only non-outliers
+            # Accumulate all orders (filtering done upstream in _filter_orders_for_tca)
             total_notional += notional
             total_reward = last_step.get('total_reward', 0)
             rewards.append(total_reward)
@@ -872,6 +893,10 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
     """
     Plots arrival price slippage (bps) with standard error bars for multiple models
     across several explanatory factors on the x-axis. Each model is a separate line.
+    
+    Note: This function expects pre-filtered data from _filter_orders_for_tca.
+          If using create_execution_summary_and_plots, filtering is applied automatically.
+          Otherwise, call _filter_orders_for_tca first.
 
     Args:
         orders_dict: Dict[str, list[list[dict]]]
@@ -887,6 +912,25 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
     """
     if factors is None:
         factors = ['ehv_pct', 'time_horizon', 'daily_volatility', 'intra_order_return']
+    
+    def weighted_mean_std(group_df):
+        """Compute notional-weighted mean and std for a group."""
+        valid = group_df['slippage'].notna() & group_df['notional'].notna() & (group_df['notional'] > 0)
+        if not valid.any():
+            return pd.Series({'mean': np.nan, 'std': np.nan, 'count': 0})
+        
+        df_valid = group_df[valid]
+        slippages = df_valid['slippage'].values
+        notionals = df_valid['notional'].values
+        
+        # Notional-weighted mean
+        wmean = np.average(slippages, weights=notionals)
+        
+        # Notional-weighted std (using reliability weights formula)
+        variance = np.average((slippages - wmean)**2, weights=notionals)
+        wstd = np.sqrt(variance)
+        
+        return pd.Series({'mean': wmean, 'std': wstd, 'count': len(df_valid)})
 
     def _orders_to_df(orders):
         rows = []
@@ -921,48 +965,17 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
                 # Side-adjust: positive means favorable move (up for buys, down for sells)
                 intra_return = raw_return if side == 'buy' else -raw_return
 
-            # Sigma-based outlier filter when daily_volatility available
-            # Determine sigma for plotting filter from analytics; fall back to lag1
-            dv_obj = first_step.get('daily_volatility', None)
-            dv_val = None
-            if dv_obj is not None:
-                try:
-                    dv_val = float(dv_obj)
-                except Exception:
-                    dv_val = None
-            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0):
-                dv1_obj = first_step.get('daily_volatility_lag1', None)
-                if dv1_obj is not None:
-                    try:
-                        dv_val = float(dv1_obj)
-                    except Exception:
-                        dv_val = None
-            if (dv_val is not None and dv_val > 0 and dv_val < 2.0) and (slippage is not None or intra_return is not None):
-                if ((slippage is not None and abs(slippage) > 3.0 * dv_val) or
-                    (intra_return is not None and abs(intra_return) > 3.0 * dv_val)):
-                    logger.warning(
-                        "Dropping outlier order in plotting: ticker=%s date=%s side=%s slippage_bps=%s intra_ret_bps=%s sigma=%.4f",
-                        first_step.get('ticker', 'NA'),
-                        first_step.get('date', 'NA'),
-                        first_step.get('side', 'NA'),
-                        'NA' if slippage is None else f"{slippage * 10000.0:.1f}",
-                        'NA' if intra_return is None else f"{intra_return * 10000.0:.1f}",
-                        dv_val,
-                    )
-                    continue
-            else:
-                logger.warning(
-                    "Dropping order due to no daily volatility: ticker=%s date=%s side=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
-                    first_step.get('ticker', 'NA'),
-                    first_step.get('date', 'NA'),
-                    first_step.get('side', 'NA'),
-                    'NA' if slippage is None else f"{slippage * 10000.0:.1f}",
-                    'NA' if intra_return is None else f"{intra_return * 10000.0:.1f}",
-                    "NA" if dv_val is None else f"{dv_val:.4f}",
-                )
-
+            # Compute notional (order_qty * arrival_price)
+            order_qty = first_step.get('order_qty', None)
+            order_vwap = last_step.get('order_vwap', None)
+            notional = None
+            if order_qty and order_vwap:
+                notional = float(order_qty) * float(order_vwap)
+            
+            # All filtering done upstream in _filter_orders_for_tca
             rows.append({
                 'slippage': slippage,
+                'notional': notional,
                 'ehv_pct': first_step.get('ehv_pct', None),
                 'time_horizon': first_step.get('time_horizon', None),
                 'daily_volatility': first_step.get('daily_volatility', None),
@@ -977,18 +990,12 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
     model_names = model_names or list(orders_dict.keys())
     model_to_df = {name: _orders_to_df(orders_dict.get(name, [])) for name in model_names}
 
-    # Build figure with a top-wide plot for date and 2x2 below for factors
+    # Build figure with 6 rows x 1 column for consistent layout
     from matplotlib.dates import DateFormatter
-    fig = plt.figure(figsize=(14, 14))
-    gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 0.8, 1.0, 1.0])
-    ax_top = fig.add_subplot(gs[0, :])
-    ax_box = fig.add_subplot(gs[1, :])
-    axes = [
-        fig.add_subplot(gs[2, 0]),
-        fig.add_subplot(gs[2, 1]),
-        fig.add_subplot(gs[3, 0]),
-        fig.add_subplot(gs[3, 1]),
-    ]
+    fig, axes_all = plt.subplots(6, 1, figsize=(14, 50))  # Increased from 20 to 50 (2.5x)
+    ax_top = axes_all[0]  # Date plot
+    ax_box = axes_all[1]  # Model comparison
+    axes = axes_all[2:6]  # 4 factor plots
 
     # Color cycle for multiple models (define before any plotting uses it)
     color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [
@@ -1025,18 +1032,21 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
             df = model_to_df[model_name]
             if df.empty or 'slippage' not in df.columns:
                 continue
-            valid = df['slippage'].notna() & df['order_date'].notna()
+            valid = df['slippage'].notna() & df['order_date'].notna() & df['notional'].notna() & (df['notional'] > 0)
             if not valid.any():
                 continue
-            dfv = df.loc[valid, ['order_date', 'slippage']].copy()
+            dfv = df.loc[valid, ['order_date', 'slippage', 'notional']].copy()
             dfv['order_date'] = pd.to_datetime(dfv['order_date'], errors='coerce').dt.to_period('W').dt.start_time.dt.date
             dfv = dfv.dropna(subset=['order_date'])
-            grouped = dfv.groupby('order_date')['slippage']
-            means = grouped.mean() * 10000.0
-            counts = grouped.count().astype(float)
-            stds = grouped.std(ddof=1).fillna(0.0)
+            
+            # Compute notional-weighted statistics by date
+            stats = dfv.groupby('order_date').apply(weighted_mean_std)
+            means = stats['mean'] * 10000.0
+            stds = stats['std'] * 10000.0
+            counts = stats['count']
+            
             with np.errstate(divide='ignore', invalid='ignore'):
-                se = (stds / np.sqrt(counts)).fillna(0.0) * 10000.0
+                se = (stds / np.sqrt(counts)).fillna(0.0)
 
             # Align to all dates
             means_full = pd.Series(index=unique_weeks, dtype=float)
@@ -1050,7 +1060,7 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
             offset = (mi - (num_models - 1) / 2.0) * per_model_width
             ax_top_count.bar(x_positions + offset, counts_full.values, width=per_model_width,
                              color=color_cycle[mi % len(color_cycle)], alpha=0.25)
-            # Plot mean slippage with SE
+            # Plot mean slippage with SE (no label here, will use shared legend)
             ax_top.errorbar(x_positions, means_full.values, yerr=se_full.values,
                             label=label_name, color=color_cycle[mi % len(color_cycle)],
                             marker='o', linestyle='-')
@@ -1059,12 +1069,11 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
         ax_top.set_xticks(x_positions)
         ax_top.set_xticklabels([pd.to_datetime(d).strftime('%Y-%m-%d') for d in unique_weeks], rotation=45, ha='right')
         ax_top.grid(True, alpha=0.3)
-        ax_top.legend(loc='best')
     else:
         ax_top.text(0.5, 0.5, 'No date data to plot', ha='center', va='center', transform=ax_top.transAxes)
 
-    # Model-wise line plot with standard error bands (replace boxplot)
-    ax_box.set_title("Arrival Slippage by Model (Mean ± SE, bps)")
+    # Model-wise line plot with standard error bands (replace boxplot) - NOTIONAL WEIGHTED
+    ax_box.set_title("Arrival Slippage by Model (Notional-Weighted Mean ± SE, bps)")
     ax_box.set_ylabel("Arrival Slippage (bps)")
     ax_box.grid(True, alpha=0.3)
     x = np.arange(len(model_names), dtype=float)
@@ -1072,16 +1081,25 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
         df = model_to_df[model_name]
         if df.empty or 'slippage' not in df.columns:
             continue
-        s = df['slippage'].dropna().values * 10000.0
-        if s.size == 0:
+        
+        # Compute notional-weighted mean and std
+        valid = df['slippage'].notna() & df['notional'].notna() & (df['notional'] > 0)
+        if not valid.any():
             continue
-        mean = float(np.mean(s))
-        se = float(np.std(s, ddof=1) / np.sqrt(s.size)) if s.size > 1 else 0.0
-        ax_box.plot([x[i]], [mean], marker='o', color=color_cycle[i % len(color_cycle)], label=(model_name or "")[0:25])
-        ax_box.fill_between([x[i]-0.25, x[i]+0.25], [mean-se, mean-se], [mean+se, mean+se], color=color_cycle[i % len(color_cycle)], alpha=0.2)
+        
+        df_valid = df[valid]
+        slippages = df_valid['slippage'].values * 10000.0
+        notionals = df_valid['notional'].values
+        
+        wmean = float(np.average(slippages, weights=notionals))
+        variance = np.average((slippages - wmean)**2, weights=notionals)
+        wstd = float(np.sqrt(variance))
+        se = wstd / np.sqrt(len(df_valid)) if len(df_valid) > 1 else 0.0
+        
+        ax_box.plot([x[i]], [wmean], marker='o', color=color_cycle[i % len(color_cycle)], label=(model_name or "")[0:25])
+        ax_box.fill_between([x[i]-0.25, x[i]+0.25], [wmean-se, wmean-se], [wmean+se, wmean+se], color=color_cycle[i % len(color_cycle)], alpha=0.2)
     ax_box.set_xticks(np.arange(len(model_names)))
-    ax_box.set_xticklabels([(m or "")[0:25] for m in model_names], rotation=0)
-    ax_box.legend(loc='best')
+    ax_box.set_xticklabels([(m or "")[0:25] for m in model_names], rotation=45, ha='right')  # Rotate labels 45 degrees
 
     # Remaining 2x2 factors below
     n_plots = min(4, len(factors))
@@ -1132,19 +1150,21 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
             df = model_to_df[model_name]
             if df.empty or 'slippage' not in df.columns:
                 continue
-            valid = df['slippage'].notna() & df[factor].notna()
-            dfv = df.loc[valid, [factor, 'slippage']].copy()
+            valid = df['slippage'].notna() & df[factor].notna() & df['notional'].notna() & (df['notional'] > 0)
+            dfv = df.loc[valid, [factor, 'slippage', 'notional']].copy()
             if dfv.empty:
                 continue
 
             dfv['bin'] = pd.cut(dfv[factor], bins=bin_edges, include_lowest=True)
-            grouped = dfv.groupby('bin', observed=True)['slippage']
-
-            means = grouped.mean() * 10000.0
-            counts = grouped.count().astype(float)
-            stds = grouped.std(ddof=1).fillna(0.0)
+            
+            # Compute notional-weighted statistics by bin
+            stats = dfv.groupby('bin', observed=True).apply(weighted_mean_std)
+            means = stats['mean'] * 10000.0
+            stds = stats['std'] * 10000.0
+            counts = stats['count']
+            
             with np.errstate(divide='ignore', invalid='ignore'):
-                se = (stds / np.sqrt(counts)).fillna(0.0) * 10000.0
+                se = (stds / np.sqrt(counts)).fillna(0.0)
             # Align counts to all bins for histogram bars
             # Ensure bin index alignment (closed='right' to match pd.cut default)
             counts_full = counts.reindex(all_bins, fill_value=0.0)
@@ -1185,25 +1205,46 @@ def plot_arrival_slippage_by_factors(orders_dict, factors=None, bins=12, model_n
         ax.set_xlim(bin_edges[0], bin_edges[-1])
         ax.set_xlabel(factor)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best')
+        # No legend on individual plots
 
-    total_slots = len(axes)
-    for j in range(n_plots, total_slots):
-        fig.delaxes(axes[j])
+    # Hide unused axes if we have fewer than 4 factors
+    for j in range(n_plots, len(axes)):
+        axes[j].set_visible(False)
 
-    plt.tight_layout()
+    # Create a single shared legend at the top of the figure
+    # Collect handles and labels from the first plot (ax_top)
+    handles, labels = ax_top.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, 
+                  loc='upper center', ncol=min(len(model_names), 6),
+                  bbox_to_anchor=(0.5, 0.99), frameon=True, fontsize=10,
+                  columnspacing=1.0, handletextpad=0.5)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])  # Leave space for legend at top
     plt.show()
 
 
-def _clean_orders_for_analysis(orders_dict, trim=0.01):
+def _filter_orders_for_tca(orders_dict, trim=0.01):
     """
-    Clean orders prior to analysis:
-      - Drop orders with |slippage| > 3 * sigma (sigma from daily_volatility or lag1)
-      - Drop orders with sigma > 0.5
-      - Trim orders outside slippage percentiles [trim, 1-trim]
-      Logs details for every dropped order.
-
-    Returns a new orders_dict with filtered orders.
+    Filter and trim orders for TCA analysis (used by both table and plots).
+    
+    Filtering criteria:
+      1. Drop orders with missing/zero arrival price
+      2. Drop orders with invalid/missing daily_volatility (sigma)
+      3. Drop orders with sigma >= 2.0 (200% daily volatility)
+      4. Two-stage trimming:
+         a. Trim top 1% by notional (remove largest trades)
+         b. Trim top/bottom 1% by slippage (remove extreme slippage values)
+    
+    Note: After two-stage trimming, the table computes notional-weighted averages.
+          Does NOT apply sigma-based slippage/return outlier filters.
+    
+    Args:
+        orders_dict: Dict[model_name, list_of_orders]
+        trim: Percentile to trim from each tail (0.01 = 1%)
+    
+    Returns:
+        Filtered orders_dict with same structure
     """
     cleaned = {}
     for model_name, orders in orders_dict.items():
@@ -1258,74 +1299,73 @@ def _clean_orders_for_analysis(orders_dict, trim=0.01):
                 intr = raw if side == 'buy' else -raw
 
             # drop if bad sigma
-            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0) or (dv_val >= 0.5):
+            if (dv_val is None) or (not np.isfinite(dv_val)) or (dv_val <= 0) or (dv_val >= 2.0):
                 logger.warning(
-                    "Dropping order (sigma invalid or >0.5): model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%s intra_ret_bps=%s sigma=%s",
+                    "Dropping order (sigma invalid or >=2.0): model=%s ticker=%s date=%s side=%s slippage_bps=%.1f sigma=%s",
                     model_name,
                     first.get('ticker', 'NA'),
                     first.get('date', 'NA'),
                     side,
-                    first.get('order_qty', 'NA'),
-                    first.get('time_horizon', 'NA'),
                     f"{slippage * 10000.0:.1f}",
-                    f"{intr * 10000.0:.1f}",
                     "NA" if dv_val is None else f"{dv_val:.4f}",
                 )
                 continue
 
-            # drop if |slippage| > 3*sigma
-            if abs(slippage) > 3.0 * dv_val:
-                logger.warning(
-                    "Dropping order (|slip|>3*sigma): model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f sigma=%.4f",
-                    model_name,
-                    first.get('ticker', 'NA'),
-                    first.get('date', 'NA'),
-                    side,
-                    first.get('order_qty', 'NA'),
-                    first.get('time_horizon', 'NA'),
-                    slippage * 10000.0,
-                    dv_val,
-                )
-                continue
+            # Compute notional for weighting
+            order_qty_val = first.get('order_qty', 0)
+            shares_remaining_val = last.get('shares_remaining', 0)
+            try:
+                filled_qty = max(0, float(order_qty_val) - float(shares_remaining_val))
+            except Exception:
+                filled_qty = 0.0
+            notional = float(vwap) * float(filled_qty)
 
             kept.append(order_info)
-            slippages_kept.append(slippage)
+            if notional > 0:
+                slippages_kept.append((slippage, notional, order_info))
 
-        # Second pass: trim by slippage percentiles
-        if kept and (trim is not None) and (trim > 0):
-            try:
-                low = float(np.nanpercentile(slippages_kept, trim * 100.0))
-                high = float(np.nanpercentile(slippages_kept, (1.0 - trim) * 100.0))
-            except Exception:
-                low, high = -np.inf, np.inf
-            trimmed = []
-            for order_info, slip in zip(kept, slippages_kept):
-                if slip < low or slip > high:
-                    first = order_info[0]
-                    last = order_info[-1]
-                    arrival = first.get('arrival_price', None)
-                    vwap = last.get('order_vwap', None)
-                    side = first.get('side', 'buy')
-                    last_mid = last.get('mid_price', None)
-                    intr = 0.0
-                    if (last_mid is not None) and (arrival not in (None, 0, np.nan)):
-                        raw = (last_mid - arrival) / arrival
-                        intr = raw if side == 'buy' else -raw
+        # Second pass: two-stage trimming (vectorized)
+        if trim > 0 and len(slippages_kept) > 0:
+            # Convert to numpy arrays for vectorized operations
+            slippages = np.array([pair[0] for pair in slippages_kept])
+            notionals = np.array([pair[1] for pair in slippages_kept])
+            orders = [pair[2] for pair in slippages_kept]
+            
+            # Stage 1: Trim top 1% by notional (vectorized)
+            notional_cutoff = np.quantile(notionals, 1 - trim)
+            notional_mask = notionals <= notional_cutoff
+            
+            # Apply notional mask
+            slippages_stage1 = slippages[notional_mask]
+            notionals_stage1 = notionals[notional_mask]
+            orders_stage1 = [orders[i] for i in np.where(notional_mask)[0]]
+            
+            # Stage 2: Trim top/bottom 1% by slippage (vectorized)
+            if len(slippages_stage1) > 0:
+                lower = np.quantile(slippages_stage1, trim)
+                upper = np.quantile(slippages_stage1, 1 - trim)
+                slippage_mask = (slippages_stage1 >= lower) & (slippages_stage1 <= upper)
+                
+                # Apply slippage mask
+                trimmed = [orders_stage1[i] for i in np.where(slippage_mask)[0]]
+                
+                # Log statistics (optional)
+                n_dropped_notional = (~notional_mask).sum()
+                n_dropped_slippage = (~slippage_mask).sum()
+                if n_dropped_notional > 0 or n_dropped_slippage > 0:
                     logger.debug(
-                        "Trimming slippage outlier: model=%s ticker=%s date=%s side=%s qty=%s horizon=%s slippage_bps=%.1f bounds=[%.1f, %.1f]",
+                        "Trimming model=%s: dropped %d by notional (>%.0f), %d by slippage (outside [%.1f, %.1f] bps)",
                         model_name,
-                        first.get('ticker', 'NA'),
-                        first.get('date', 'NA'),
-                        side,
-                        first.get('order_qty', 'NA'),
-                        first.get('time_horizon', 'NA'),
-                        slip * 10000.0,
-                        low * 10000.0,
-                        high * 10000.0,
+                        n_dropped_notional,
+                        notional_cutoff,
+                        n_dropped_slippage,
+                        lower * 10000.0,
+                        upper * 10000.0,
                     )
-                    continue
-                trimmed.append(order_info)
-            cleaned[model_name] = trimmed
+                
+                cleaned[model_name] = trimmed
+            else:
+                cleaned[model_name] = []
         else:
             cleaned[model_name] = kept
 
@@ -1334,50 +1374,68 @@ def _clean_orders_for_analysis(orders_dict, trim=0.01):
 
 def create_execution_summary_and_plots(orders_dict, trim=0.01):
     """
-    Clean data, print the execution summary table, and render plots.
+    Print the execution summary table and render plots.
+    
+    Applies unified filtering once, then passes cleaned data to table and plots.
     """
-    cleaned = _clean_orders_for_analysis(orders_dict, trim=trim)
-    create_execution_summary_table(cleaned, trim=trim)
-    plot_arrival_slippage_by_factors(cleaned)
-    plot_actions_vs_normalized_horizon_with_returns(cleaned)
-    plot_orders(cleaned, num_orders=3)
+    # Apply unified filtering: drop bad data + notional-weighted trimming
+    filtered = _filter_orders_for_tca(orders_dict, trim=trim)
+    
+    # Pass filtered data to table and plots
+    create_execution_summary_table(filtered, trim=0)  # No additional trimming in table
+    plot_arrival_slippage_by_factors(filtered)
+    plot_actions_vs_normalized_horizon_with_returns(filtered)
+    plot_orders(filtered, num_orders=3)
 
 
-def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, model_b=None, num_bins=10):
+def plot_actions_vs_normalized_horizon_with_returns(orders_dict, models=None, num_bins=10):
     """
-    Plot side-by-side boxplots of actions (%) for two models across normalized horizon bins.
+    Plot actions (%) for multiple models across normalized horizon bins.
 
     - Normalized horizon: current_step / time_horizon
     - num_bins: number of equal-width bins on [0, 1]
-    - For each bin, show two boxplots side-by-side (one per model)
+    - Supports comparing multiple models (e.g., CNN, MLP, TCN)
 
     Args:
         orders_dict: Dict[str, list[list[dict]]]
-        model_a: Optional[str] name of first model; defaults to first key
-        model_b: Optional[str] name of second model; defaults to second key
+        models: Optional[list[str]] list of model names to plot.
+                If None, auto-selects CNN, MLP, TCN models
         num_bins: int number of bins (default 10)
+    
+    Example:
+        # Auto-detect
+        plot_actions_vs_normalized_horizon_with_returns(orders_dict)
+        
+        # Specify models
+        plot_actions_vs_normalized_horizon_with_returns(
+            orders_dict,
+            models=['ppo_cnn_...', 'ppo_mlp_...', 'ppo_tcn_...']
+        )
     """
 
     model_names = list(orders_dict.keys())
-    # Auto-select two PPO models if not specified
-    if model_a is None or model_b is None:
-        ppo_models = [m for m in model_names if 'ppo' in (m or '').lower()]
-        if len(ppo_models) >= 2:
-            if model_a is None:
-                model_a = ppo_models[0]
-            if model_b is None:
-                # pick the next distinct PPO model
-                model_b = next((m for m in ppo_models if m != model_a), None)
-        else:
-            # fallback to first two models
-            if len(model_names) >= 2:
-                model_a = model_a or model_names[0]
-                model_b = model_b or (model_names[1] if model_names[0] == model_a else model_names[0])
-            else:
-                print("plot_action_boxplots_by_normalized_horizon: need two models to compare")
-                return
-    if model_a not in orders_dict or model_b not in orders_dict:
-        print("plot_action_boxplots_by_normalized_horizon: specified models not in orders_dict")
+    
+    # Auto-select CNN, MLP, TCN models if not specified
+    if models is None:
+        models_to_plot = []
+        
+        # Look for specific model types in order
+        for model_type in ['cnn', 'mlp', 'tcn']:
+            matching = [m for m in model_names if model_type in (m or '').lower()]
+            if matching:
+                models_to_plot.append(matching[0])
+        
+        # If we didn't find specific types, just use first few models
+        if len(models_to_plot) == 0:
+            models_to_plot = model_names[:3]
+    else:
+        # Use provided models, filtering out any that don't exist
+        models_to_plot = [m for m in models if m in orders_dict]
+    
+    if len(models_to_plot) < 2:
+        print(f"plot_actions_vs_normalized_horizon: need at least 2 models to compare")
+        print(f"  Found: {models_to_plot}")
+        print(f"  Available: {model_names}")
         return
 
     bins = np.linspace(0.0, 1.0, num_bins + 1)
@@ -1436,10 +1494,13 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
                     per_bin_returns[idx].append(sret * 10000.0)
         return per_bin_actions, per_bin_returns
 
-    a_bins, a_returns = collect_actions_by_bin(orders_dict[model_a])
-    b_bins, b_returns = collect_actions_by_bin(orders_dict[model_b])
+    # Collect data for all models
+    model_data = {}
+    for model in models_to_plot:
+        bins_data, returns_data = collect_actions_by_bin(orders_dict[model])
+        model_data[model] = {'bins': bins_data, 'returns': returns_data}
 
-    # Prepare boxplot inputs: for each bin, two datasets -> positions offset around bin center
+    # Prepare colors
     color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [
         'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple',
         'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan'
@@ -1466,10 +1527,12 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
                 ses.append(se)
         return np.array(means, dtype=float), np.array(ses, dtype=float), np.array(counts, dtype=float)
 
-    ma, sea, ca = compute_stats(a_bins)
-    mb, seb, cb = compute_stats(b_bins)
-    mra, sra, _ = compute_stats(a_returns)
-    mrb, srb, _ = compute_stats(b_returns)
+    # Compute stats for all models
+    model_stats = {}
+    for model in models_to_plot:
+        ma, sea, ca = compute_stats(model_data[model]['bins'])
+        mra, sra, _ = compute_stats(model_data[model]['returns'])
+        model_stats[model] = {'mean': ma, 'se': sea, 'count': ca, 'ret_mean': mra, 'ret_se': sra}
 
     # Helper to compute side-adjusted intra-order return per order
     def side_adjusted_return(order_info):
@@ -1487,20 +1550,16 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
             return np.nan
         return raw if side == 'buy' else -raw
 
-    # Collect returns for tertile split across both models
+    # Collect returns for tertile split across all models
     returns_all = []
-    model_a_returns = []
-    model_b_returns = []
-    for oi in orders_dict[model_a]:
-        r = side_adjusted_return(oi)
-        model_a_returns.append(r)
-        if np.isfinite(r):
-            returns_all.append(r)
-    for oi in orders_dict[model_b]:
-        r = side_adjusted_return(oi)
-        model_b_returns.append(r)
-        if np.isfinite(r):
-            returns_all.append(r)
+    model_returns = {}
+    for model in models_to_plot:
+        model_returns[model] = []
+        for oi in orders_dict[model]:
+            r = side_adjusted_return(oi)
+            model_returns[model].append(r)
+            if np.isfinite(r):
+                returns_all.append(r)
 
     # Compute tertile thresholds
     if len(returns_all) >= 3:
@@ -1533,73 +1592,103 @@ def plot_actions_vs_normalized_horizon_with_returns(orders_dict, model_a=None, m
         mrb_s, srb_s, _ = compute_stats(b_ret)
         return ma_s, sea_s, mb_s, seb_s, mra_s, sra_s, mrb_s, srb_s
 
-    la = (model_a or "")[0:25]
-    lb = (model_b or "")[0:25]
+    # Get short labels for models
+    model_labels = {m: (m or "")[:25] for m in models_to_plot}
 
-    # Build 4 stacked panels: overall + positive + neutral + negative
-    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
-    panels = [
-        (axes[0], "Actions by Normalized Horizon (Mean ± SE) — Overall", ma, sea, mb, seb, mra, sra, mrb, srb),
-        (axes[1], "Positive Side-Adj Return (top tertile)",) + stats_for_subset(
-            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive'),
-            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive')
-        ),
-        (axes[2], "Neutral Side-Adj Return (middle tertile)",) + stats_for_subset(
-            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral'),
-            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral')
-        ),
-        (axes[3], "Negative Side-Adj Return (bottom tertile)",) + stats_for_subset(
-            filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative'),
-            filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative')
-        ),
-    ]
+    # Build 4 rows × 1 column layout: overall + positive + neutral + negative
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
+    
+    # Helper function to compute stats for filtered subsets
+    def stats_for_subset_multi(models_list, subset_dict):
+        """Compute stats for all models in a given tertile subset"""
+        stats_dict = {}
+        for model in models_list:
+            subset = subset_dict[model]
+            binned, ret = collect_actions_by_bin(subset)
+            ma_s, sea_s, _ = compute_stats(binned)
+            mra_s, sra_s, _ = compute_stats(ret)
+            stats_dict[model] = {'mean': ma_s, 'se': sea_s, 'ret_mean': mra_s, 'ret_se': sra_s}
+        return stats_dict
 
-    def plot_panel(ax, title, ma_p, sea_p, mb_p, seb_p, ra_p, sra_p, rb_p, srb_p):
-        ax.set_title(title)
-        ax.set_ylabel("Action (%)")
-        # Model A
-        ax.plot(bin_centers, ma_p, color=color_cycle[0], marker='o', label=la)
-        ax.fill_between(bin_centers, ma_p - sea_p, ma_p + sea_p, color=color_cycle[0], alpha=0.2)
-        # Model B
-        ax.plot(bin_centers, mb_p, color=color_cycle[1], marker='o', label=lb)
-        ax.fill_between(bin_centers, mb_p - seb_p, mb_p + seb_p, color=color_cycle[1], alpha=0.2)
+    def plot_panel(ax, title, stats_dict):
+        """Plot panel with multiple models, no individual legends"""
+        ax.set_title(title, fontsize=12, pad=10)
+        ax.set_ylabel("Action (%)", fontsize=11)
         ax.grid(True, alpha=0.3)
-        # Secondary axis: mean side-adjusted intra-order return (bps) per bin
-        ax2 = ax.twinx()
-        ax2.plot(bin_centers, ra_p, color=color_cycle[0], linestyle='--', alpha=0.6, label=f"{la} ret (bps)")
-        ax2.fill_between(bin_centers, ra_p - sra_p, ra_p + sra_p, color=color_cycle[0], alpha=0.15)
-        ax2.plot(bin_centers, rb_p, color=color_cycle[1], linestyle='--', alpha=0.6, label=f"{lb} ret (bps)")
-        ax2.fill_between(bin_centers, rb_p - srb_p, rb_p + srb_p, color=color_cycle[1], alpha=0.15)
-        ax2.set_ylabel("Side-Adj Return (bps)")
-        try:
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(lines1 + lines2, labels1 + labels2, loc='best')
-        except Exception:
-            pass
-
-    plot_panel(axes[0], panels[0][1], panels[0][2], panels[0][3], panels[0][4], panels[0][5], panels[0][6], panels[0][7], panels[0][8], panels[0][9])
-    # Positive subset
-    pa = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'positive')
-    pb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'positive')
-    ma_p, sea_p, mb_p, seb_p, mra_p, sra_p, mrb_p, srb_p = stats_for_subset(pa, pb)
-    plot_panel(axes[1], panels[1][1], ma_p, sea_p, mb_p, seb_p, mra_p, sra_p, mrb_p, srb_p)
-    # Neutral subset
-    na = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'neutral')
-    nb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'neutral')
-    ma_n, sea_n, mb_n, seb_n, mra_n, sra_n, mrb_n, srb_n = stats_for_subset(na, nb)
-    plot_panel(axes[2], panels[2][1], ma_n, sea_n, mb_n, seb_n, mra_n, sra_n, mrb_n, srb_n)
-    # Negative subset
-    ga = filter_orders_by_tertile(orders_dict[model_a], model_a_returns, 'negative')
-    gb = filter_orders_by_tertile(orders_dict[model_b], model_b_returns, 'negative')
-    ma_g, sea_g, mb_g, seb_g, mra_g, sra_g, mrb_g, srb_g = stats_for_subset(ga, gb)
-    plot_panel(axes[3], panels[3][1], ma_g, sea_g, mb_g, seb_g, mra_g, sra_g, mrb_g, srb_g)
-
-    axes[-1].set_xlabel("Normalized Horizon")
-    for ax in axes:
         ax.set_xlim(0.0, 1.0)
         ax.set_xticks(bin_centers)
-    # Legend handled per-panel
+        
+        # Plot each model
+        for idx, model in enumerate(models_to_plot):
+            color = color_cycle[idx % len(color_cycle)]
+            label = model_labels[model]
+            
+            ma_p = stats_dict[model]['mean']
+            sea_p = stats_dict[model]['se']
+            
+            # Main axis: actions
+            ax.plot(bin_centers, ma_p, color=color, marker='o', label=label, linewidth=2)
+            ax.fill_between(bin_centers, ma_p - sea_p, ma_p + sea_p, color=color, alpha=0.2)
+        
+        # Secondary axis: returns
+        ax2 = ax.twinx()
+        ax2.set_ylabel("Side-Adj Return (bps)", fontsize=11)
+        
+        for idx, model in enumerate(models_to_plot):
+            color = color_cycle[idx % len(color_cycle)]
+            label = model_labels[model]
+            
+            ra_p = stats_dict[model]['ret_mean']
+            sra_p = stats_dict[model]['ret_se']
+            
+            ax2.plot(bin_centers, ra_p, color=color, linestyle='--', alpha=0.6, label=f"{label} ret")
+            ax2.fill_between(bin_centers, ra_p - sra_p, ra_p + sra_p, color=color, alpha=0.15)
+        
+        return ax2  # Return secondary axis for legend extraction
 
-    plt.tight_layout()
+    # Plot overall panel
+    ax0 = plot_panel(axes[0], "Actions by Normalized Horizon (Mean ± SE) — Overall", model_stats)
+    
+    # Create filtered subsets for each tertile
+    positive_subsets = {m: filter_orders_by_tertile(orders_dict[m], model_returns[m], 'positive') 
+                       for m in models_to_plot}
+    neutral_subsets = {m: filter_orders_by_tertile(orders_dict[m], model_returns[m], 'neutral') 
+                      for m in models_to_plot}
+    negative_subsets = {m: filter_orders_by_tertile(orders_dict[m], model_returns[m], 'negative') 
+                       for m in models_to_plot}
+    
+    # Compute stats for each tertile
+    positive_stats = stats_for_subset_multi(models_to_plot, positive_subsets)
+    neutral_stats = stats_for_subset_multi(models_to_plot, neutral_subsets)
+    negative_stats = stats_for_subset_multi(models_to_plot, negative_subsets)
+    
+    # Plot tertile panels
+    plot_panel(axes[1], "Positive Side-Adj Return (top tertile)", positive_stats)
+    plot_panel(axes[2], "Neutral Side-Adj Return (middle tertile)", neutral_stats)
+    plot_panel(axes[3], "Negative Side-Adj Return (bottom tertile)", negative_stats)
+    
+    axes[3].set_xlabel("Normalized Horizon", fontsize=11)
+    
+    # Create a single shared legend at the top of the figure
+    # Collect handles and labels from the first panel
+    lines1, labels1 = axes[0].get_legend_handles_labels()
+    # Get secondary axis from first panel
+    for child in axes[0].get_children():
+        if hasattr(child, 'get_legend_handles_labels'):
+            try:
+                lines2, labels2 = child.get_legend_handles_labels()
+                if lines2:  # Found the secondary axis
+                    break
+            except:
+                pass
+    else:
+        lines2, labels2 = [], []
+    
+    # Place legend above all subplots
+    fig.legend(lines1 + lines2, labels1 + labels2, 
+              loc='upper center', ncol=min(len(models_to_plot), 6), 
+              bbox_to_anchor=(0.5, 0.98), frameon=True, fontsize=10,
+              columnspacing=1.0, handletextpad=0.5)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.97])  # Leave space for legend at top
     plt.show()
