@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -414,6 +415,342 @@ def _fitness_from_orders(orders):
     return -float(np.mean(costs)) if costs else -np.inf
 
 
+def plot_archive_surfaces(train_grid, test_grid, baseline_train, baseline_test,
+                          B_LIQ=3, B_VOL=3, title="MAP-Elites Archive",
+                          save_path=None, ensemble_test_grid=None):
+    """
+    Side-by-side 3D surface plots.
+    Specialist surface coloured green/red vs baseline;
+    baseline shown as semi-transparent red plane.
+    If ensemble_test_grid is provided a third panel is added.
+    """
+    panels = [
+        (train_grid, baseline_train, "Train (Specialist)"),
+        (test_grid, baseline_test, "Test (Specialist)"),
+    ]
+    if ensemble_test_grid is not None:
+        panels.append(
+            (ensemble_test_grid, baseline_test, "Test (Ensemble)")
+        )
+
+    n_panels = len(panels)
+    fig = plt.figure(figsize=(8 * n_panels, 7))
+    labels = (
+        ["Low", "Med", "High"] if B_LIQ == 3
+        else [str(k) for k in range(B_LIQ)]
+    )
+    x = np.arange(B_LIQ)
+    y = np.arange(B_VOL)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+
+    for panel, (grid, bl, ptitle) in enumerate(panels):
+        ax = fig.add_subplot(1, n_panels, panel + 1, projection='3d')
+        Z = np.ma.masked_invalid(grid.copy())
+
+        fc = np.empty((B_LIQ - 1, B_VOL - 1, 4))
+        for i in range(B_LIQ - 1):
+            for j in range(B_VOL - 1):
+                avg = np.nanmean(
+                    [grid[i, j], grid[i + 1, j],
+                     grid[i, j + 1], grid[i + 1, j + 1]]
+                )
+                fc[i, j] = (
+                    (0.18, 0.80, 0.44, 0.85) if avg >= bl
+                    else (0.91, 0.30, 0.24, 0.85)
+                )
+
+        ax.plot_surface(
+            X, Y, Z, facecolors=fc,
+            edgecolor='k', linewidth=0.6, shade=True,
+        )
+
+        xx, yy = np.meshgrid(
+            np.linspace(-0.5, B_LIQ - 0.5, 10),
+            np.linspace(-0.5, B_VOL - 0.5, 10),
+        )
+        ax.plot_surface(
+            xx, yy, np.full_like(xx, bl), alpha=0.25, color='red',
+        )
+
+        ax.set_xlabel('Liquidity')
+        ax.set_ylabel('Volatility')
+        ax.set_zlabel('Fitness (-cost)')
+        ax.set_title(ptitle)
+        ax.set_xticks(range(B_LIQ))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_yticks(range(B_VOL))
+        ax.set_yticklabels(labels, fontsize=8)
+
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_path}")
+    plt.show()
+
+
+def plot_archive_heatmap(train_grid, test_grid,
+                         baseline_train, baseline_test,
+                         B_LIQ=3, B_VOL=3,
+                         title="MAP-Elites Archive",
+                         save_path=None,
+                         ensemble_test_grid=None):
+    """
+    Side-by-side annotated heatmaps.
+    Colour = specialist delta vs baseline (RdYlGn diverging).
+    Each cell annotated with fitness value and percentage delta.
+    If ensemble_test_grid is provided a third panel is added.
+    """
+    from matplotlib.colors import TwoSlopeNorm
+
+    panels = [
+        (train_grid, baseline_train, "Train (Specialist)"),
+        (test_grid, baseline_test, "Test (Specialist)"),
+    ]
+    if ensemble_test_grid is not None:
+        panels.append(
+            (ensemble_test_grid, baseline_test, "Test (Ensemble)")
+        )
+
+    n_panels = len(panels)
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(7 * n_panels, 5.5),
+    )
+    if n_panels == 1:
+        axes = [axes]
+    tick_labels = (
+        ["Low", "Med", "High"] if B_LIQ == 3
+        else [str(k) for k in range(B_LIQ)]
+    )
+
+    for ax, (grid, bl, ptitle) in zip(axes, panels):
+        diff = grid - bl
+        vmax = np.nanmax(np.abs(diff))
+        if vmax == 0:
+            vmax = 1e-6
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+        im = ax.imshow(
+            diff.T, origin='lower', cmap='RdYlGn',
+            norm=norm, aspect='equal',
+        )
+
+        for i in range(B_LIQ):
+            for j in range(B_VOL):
+                val = grid[i, j]
+                if np.isnan(val):
+                    ax.text(
+                        i, j, "\u2014", ha='center', va='center',
+                        fontsize=10, color='grey',
+                    )
+                    continue
+                delta_pct = (
+                    (val - bl) / abs(bl) * 100 if bl != 0 else 0.0
+                )
+                sign = "+" if delta_pct >= 0 else ""
+                ax.text(
+                    i, j,
+                    f"{val:.4f}\n{sign}{delta_pct:.1f}%",
+                    ha='center', va='center', fontsize=8,
+                    fontweight='bold',
+                )
+
+        ax.set_xticks(range(B_LIQ))
+        ax.set_xticklabels(tick_labels)
+        ax.set_yticks(range(B_VOL))
+        ax.set_yticklabels(tick_labels)
+        ax.set_xlabel('Liquidity')
+        ax.set_ylabel('Volatility')
+        ax.set_title(f"{ptitle}  (baseline = {bl:.5f})", fontsize=11)
+        cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label('\u0394 Fitness vs Baseline')
+
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_path}")
+    plt.show()
+
+
+def print_results_table(results_df, B_LIQ=3, B_VOL=3):
+    vol_labels = ["Low", "Medium", "High"][:B_VOL]
+    liq_labels = ["Low", "Medium", "High"][:B_LIQ]
+
+    print(f"\n{'Volatility':<12} {'Liquidity':<12} {'Fitness':>10} "
+          f"{'vs Baseline':>12} {'N Orders':>10}")
+    print("=" * 58)
+
+    w_spec, w_base, total_n = 0.0, 0.0, 0
+    for j in range(B_VOL):
+        for i in range(B_LIQ):
+            r = results_df[(results_df.liq_bin == i) & (results_df.vol_bin == j)]
+            if r.empty: continue
+            r = r.iloc[0]
+            fit, imp, n = r.specialist_fitness, r.improvement_pct, int(r.n_orders)
+            if np.isnan(fit):
+                print(f"{vol_labels[j]:<12} {liq_labels[i]:<12} {'empty':>10} "
+                      f"{'—':>12} {n:>10}")
+                continue
+            s = f"+{imp:.1f}%" if imp > 0 else f"{imp:.1f}%"
+            print(f"{vol_labels[j]:<12} {liq_labels[i]:<12} {fit:>10.5f} {s:>12} {n:>10}")
+            if not np.isnan(r.baseline_fitness):
+                w_spec += fit * n; w_base += r.baseline_fitness * n; total_n += n
+
+    print("-" * 58)
+    if total_n:
+        ov_s, ov_b = w_spec/total_n, w_base/total_n
+        ov_i = (ov_s - ov_b) / abs(ov_b) * 100 if ov_b else 0
+        s = f"+{ov_i:.1f}%" if ov_i > 0 else f"{ov_i:.1f}%"
+        print(f"{'Overall':<12} {'':12} {ov_s:>10.5f} {s:>12} {total_n:>10}")
+
+
+def evaluate_archive_on_orders(archive, env, baseline_model, orders_df,
+                                cell2indices, B_LIQ=3, B_VOL=3, vecnorm=None):
+    """
+    For each cell: run specialist + baseline on phenotype-matched orders.
+    Uses VecNormPolicyWrapper to swap snapshots in/out of a single model.
+    """
+    wrapper = VecNormPolicyWrapper(baseline_model, vecnorm)
+    wrapper.policy.eval()
+    baseline_snap = snapshot_policy(baseline_model)
+
+    results = []
+
+    for i in range(B_LIQ):
+        for j in range(B_VOL):
+            idxs = cell2indices.get((i, j), [])
+            cell = archive.grid[i][j]
+
+            if len(idxs) == 0 or cell is None:
+                results.append(dict(
+                    liq_bin=i, vol_bin=j, n_orders=len(idxs),
+                    specialist_fitness=np.nan, baseline_fitness=np.nan,
+                    improvement_pct=np.nan))
+                continue
+
+            # Specialist
+            wrapper.load_policy_snapshot(cell["snapshot"], device="cpu")
+            spec_orders = env.execute_orders_vectorized(
+                wrapper, idxs, collect_step_info=True,
+                show_progress=False, model_name=f"ME@{i}-{j}")
+            spec_fit = _fitness_from_orders(spec_orders)
+
+            # Baseline on same orders
+            wrapper.load_policy_snapshot(baseline_snap, device="cpu")
+            base_orders = env.execute_orders_vectorized(
+                wrapper, idxs, collect_step_info=True,
+                show_progress=False, model_name=f"base@{i}-{j}")
+            base_fit = _fitness_from_orders(base_orders)
+
+            imp = ((spec_fit - base_fit) / abs(base_fit) * 100
+                   if base_fit != 0 and not np.isnan(base_fit) else np.nan)
+
+            results.append(dict(
+                liq_bin=i, vol_bin=j, n_orders=len(idxs),
+                specialist_fitness=spec_fit, baseline_fitness=base_fit,
+                improvement_pct=imp))
+
+            print(f"  ({i},{j}): spec={spec_fit:.5f} base={base_fit:.5f} "
+                  f"Δ={imp:+.1f}% n={len(idxs)}")
+
+    # Restore baseline
+    wrapper.load_policy_snapshot(baseline_snap, device="cpu")
+    return pd.DataFrame(results)
+
+
+def build_ensemble_grid(results_df, B_LIQ=3, B_VOL=3):
+    """
+    Build a fitness grid using the best of specialist or baseline per cell.
+    """
+    grid = np.full((B_LIQ, B_VOL), np.nan)
+    for _, row in results_df.iterrows():
+        i, j = int(row.liq_bin), int(row.vol_bin)
+        spec = row.specialist_fitness
+        base = row.baseline_fitness
+        if np.isnan(spec) and np.isnan(base):
+            continue
+        elif np.isnan(spec):
+            grid[i, j] = base
+        elif np.isnan(base):
+            grid[i, j] = spec
+        else:
+            grid[i, j] = max(spec, base)
+    return grid
+
+
+def execute_ensemble_orders(
+    archive, env, baseline_model, orders_df, order_indices,
+    test_results, B_LIQ=3, B_VOL=3, vecnorm=None,
+):
+    """
+    Execute orders using a best-of-specialist/baseline ensemble.
+    Each order is routed to whichever model (specialist or baseline)
+    had higher fitness in its (liq_bin, vol_bin) cell during evaluation.
+
+    Returns a list of order traces in the same positional order as
+    *order_indices*, compatible with the TCA pipeline.
+    """
+    use_specialist = {}
+    for _, row in test_results.iterrows():
+        i, j = int(row.liq_bin), int(row.vol_bin)
+        spec = row.specialist_fitness
+        base = row.baseline_fitness
+        if np.isnan(spec) or archive.grid[i][j] is None:
+            use_specialist[(i, j)] = False
+        elif np.isnan(base):
+            use_specialist[(i, j)] = True
+        else:
+            use_specialist[(i, j)] = spec > base
+
+    wrapper = VecNormPolicyWrapper(baseline_model, vecnorm)
+    wrapper.policy.eval()
+    baseline_snap = snapshot_policy(baseline_model)
+
+    orders_view = (
+        orders_df[["liq_norm", "vol_norm"]]
+        .fillna(0.0)
+        .to_numpy(dtype=float)
+    )
+
+    cell_groups = {}
+    for pos, idx in enumerate(order_indices):
+        liq, vol = orders_view[idx]
+        i = _to_bin(liq, B_LIQ)
+        j = _to_bin(vol, B_VOL)
+        cell_groups.setdefault((i, j), []).append((pos, idx))
+
+    results = [None] * len(order_indices)
+
+    n_spec_cells = sum(1 for v in use_specialist.values() if v)
+    n_base_cells = sum(1 for v in use_specialist.values() if not v)
+    print(f"Ensemble routing: {n_spec_cells} specialist cells, "
+          f"{n_base_cells} baseline cells")
+
+    for (i, j), pos_idx_pairs in tqdm(
+        cell_groups.items(), desc="Ensemble execution"
+    ):
+        positions = [p for p, _ in pos_idx_pairs]
+        idxs = [idx for _, idx in pos_idx_pairs]
+
+        if use_specialist.get((i, j), False):
+            snap = archive.grid[i][j]["snapshot"]
+            wrapper.load_policy_snapshot(snap, device="cpu")
+            tag = f"ens_spec@{i}-{j}"
+        else:
+            wrapper.load_policy_snapshot(baseline_snap, device="cpu")
+            tag = f"ens_base@{i}-{j}"
+
+        cell_orders = env.execute_orders_vectorized(
+            wrapper, idxs, collect_step_info=True,
+            show_progress=False, model_name=tag,
+        )
+        for pos, trace in zip(positions, cell_orders):
+            results[pos] = trace
+
+    wrapper.load_policy_snapshot(baseline_snap, device="cpu")
+    return results
+
 
 def map_elites_liquidity_volatility_seeded(
     env,
@@ -462,12 +799,17 @@ def map_elites_liquidity_volatility_seeded(
         vol = float(orders_df.loc[idxs, "vol_norm"].mean())
         archive.insert(i, j, seed_snap, fit, (liq, vol))
 
-    # --- Illumination loop ---
+    # --- Illumination loop (cross-cell parent sampling) ---
     logging.info(f"Illumination loop: iterating {iters} times")
     for _ in tqdm(range(iters), desc="Illumination loop: iterating over iterations",position=1, leave=False):
+        occupied = [
+            (ii, jj) for ii in range(B_LIQ) for jj in range(B_VOL)
+            if archive.grid[ii][jj] is not None
+        ]
         targets = random.choices(nonempty_cells, k=min(children_per_iter, len(nonempty_cells)))
         for (i, j) in targets:
-            parent_snap = archive.grid[i][j]["snapshot"] if archive.grid[i][j] else seed_snap
+            pi, pj = random.choice(occupied)
+            parent_snap = archive.grid[pi][pj]["snapshot"]
             child_snap = mutate_policy_snapshot(parent_snap, sigma=sigma)
 
             idxs = _sample_idxs(i, j, eval_k)
@@ -547,14 +889,19 @@ def map_elites_with_tracking(env, ppo_seed, cell2indices, nonempty_cells, orders
     # Capture initial state after seeding
     archive_snapshots.append(capture_archive_state())
     
-    # Illumination loop with progress tracking
+    # Illumination loop with progress tracking (cross-cell parent sampling)
     print(f"  Illumination: {iters} iterations × {children_per_iter} children")
     for iter_idx in tqdm(range(iters), desc="  Illumination", leave=False):
+        occupied = [
+            (ii, jj) for ii in range(B_LIQ) for jj in range(B_VOL)
+            if archive.grid[ii][jj] is not None
+        ]
         targets = random.choices(nonempty_cells, k=min(children_per_iter, len(nonempty_cells)))
         
         improvements = 0
         for (i, j) in targets:
-            parent_snap = archive.grid[i][j]["snapshot"] if archive.grid[i][j] else seed_snap
+            pi, pj = random.choice(occupied)
+            parent_snap = archive.grid[pi][pj]["snapshot"]
             child_snap = mutate_policy_snapshot(parent_snap, sigma=sigma)
             
             idxs = _sample_idxs(i, j, eval_k)
@@ -634,11 +981,16 @@ def map_elites_with_capture(env, ppo_seed, cell2indices, nonempty_cells, orders_
     
     grid_history.append(capture_grid())
     
-    # Illumination with progress bar
+    # Illumination with progress bar (cross-cell parent sampling)
     for iter_idx in tqdm(range(iters), desc="  MAP-Elites iterations"):
+        occupied = [
+            (ii, jj) for ii in range(B_LIQ) for jj in range(B_VOL)
+            if archive.grid[ii][jj] is not None
+        ]
         targets = random.choices(nonempty_cells, k=min(children_per_iter, len(nonempty_cells)))
         for (i, j) in targets:
-            parent_snap = archive.grid[i][j]["snapshot"] if archive.grid[i][j] else seed_snap
+            pi, pj = random.choice(occupied)
+            parent_snap = archive.grid[pi][pj]["snapshot"]
             child_snap = mutate_policy_snapshot(parent_snap, sigma=sigma)
             
             idxs = _sample_idxs(i, j, eval_k)
