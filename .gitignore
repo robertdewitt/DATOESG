@@ -6,7 +6,6 @@ __pycache__/
 Gym/._mana_data
 .DS_Store/
 Gym/.DS_Store/
-
 .vscode/
 Gym/.venv/
 Gym/.vscode/
@@ -16,6 +15,4 @@ Gym/tensorboard_logs/
 mana_archive/
 old_projects/
 priceprop/
-
-
 .DS_Store
