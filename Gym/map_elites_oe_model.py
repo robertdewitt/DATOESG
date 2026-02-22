@@ -573,36 +573,76 @@ def plot_archive_heatmap(train_grid, test_grid,
     plt.show()
 
 
-def print_results_table(results_df, B_LIQ=3, B_VOL=3):
+def print_results_table(results_df, B_LIQ=3, B_VOL=3, label="Specialist"):
+    """
+    Print a per-cell results table.
+    *label* is shown in the header (e.g. "Specialist" or "Ensemble").
+    """
     vol_labels = ["Low", "Medium", "High"][:B_VOL]
     liq_labels = ["Low", "Medium", "High"][:B_LIQ]
 
-    print(f"\n{'Volatility':<12} {'Liquidity':<12} {'Fitness':>10} "
-          f"{'vs Baseline':>12} {'N Orders':>10}")
-    print("=" * 58)
+    header = (f"\n{'Vol':<8} {'Liq':<8} {'Baseline':>10} "
+              f"{label:>10} {'Δ%':>8} {'Best':>6} {'N':>7}")
+    print(header)
+    print("=" * len(header.strip()))
 
-    w_spec, w_base, total_n = 0.0, 0.0, 0
+    w_spec, w_base, w_ens, total_n = 0.0, 0.0, 0.0, 0
     for j in range(B_VOL):
         for i in range(B_LIQ):
-            r = results_df[(results_df.liq_bin == i) & (results_df.vol_bin == j)]
-            if r.empty: continue
-            r = r.iloc[0]
-            fit, imp, n = r.specialist_fitness, r.improvement_pct, int(r.n_orders)
-            if np.isnan(fit):
-                print(f"{vol_labels[j]:<12} {liq_labels[i]:<12} {'empty':>10} "
-                      f"{'—':>12} {n:>10}")
+            r = results_df[
+                (results_df.liq_bin == i) & (results_df.vol_bin == j)
+            ]
+            if r.empty:
                 continue
-            s = f"+{imp:.1f}%" if imp > 0 else f"{imp:.1f}%"
-            print(f"{vol_labels[j]:<12} {liq_labels[i]:<12} {fit:>10.5f} {s:>12} {n:>10}")
-            if not np.isnan(r.baseline_fitness):
-                w_spec += fit * n; w_base += r.baseline_fitness * n; total_n += n
+            r = r.iloc[0]
+            spec = r.specialist_fitness
+            base = r.baseline_fitness
+            n = int(r.n_orders)
 
-    print("-" * 58)
+            if np.isnan(spec) and np.isnan(base):
+                print(f"{vol_labels[j]:<8} {liq_labels[i]:<8} "
+                      f"{'—':>10} {'—':>10} {'—':>8} {'—':>6} {n:>7}")
+                continue
+
+            ens = max(
+                spec if not np.isnan(spec) else -np.inf,
+                base if not np.isnan(base) else -np.inf,
+            )
+            delta_pct = (
+                (spec - base) / abs(base) * 100
+                if (not np.isnan(spec) and not np.isnan(base)
+                    and base != 0)
+                else np.nan
+            )
+            d_str = (
+                f"{delta_pct:+.1f}%" if not np.isnan(delta_pct) else "—"
+            )
+            best = "spec" if (not np.isnan(spec) and spec >= ens) else "base"
+
+            b_str = f"{base:.5f}" if not np.isnan(base) else "—"
+            s_str = f"{spec:.5f}" if not np.isnan(spec) else "—"
+
+            print(f"{vol_labels[j]:<8} {liq_labels[i]:<8} "
+                  f"{b_str:>10} {s_str:>10} {d_str:>8} {best:>6} {n:>7}")
+
+            if not np.isnan(spec):
+                w_spec += spec * n
+            if not np.isnan(base):
+                w_base += base * n
+            w_ens += ens * n
+            total_n += n
+
+    print("-" * len(header.strip()))
     if total_n:
-        ov_s, ov_b = w_spec/total_n, w_base/total_n
+        ov_s = w_spec / total_n
+        ov_b = w_base / total_n
+        ov_e = w_ens / total_n
         ov_i = (ov_s - ov_b) / abs(ov_b) * 100 if ov_b else 0
-        s = f"+{ov_i:.1f}%" if ov_i > 0 else f"{ov_i:.1f}%"
-        print(f"{'Overall':<12} {'':12} {ov_s:>10.5f} {s:>12} {total_n:>10}")
+        ov_ei = (ov_e - ov_b) / abs(ov_b) * 100 if ov_b else 0
+        print(f"{'Wt-Avg':<8} {'':8} {ov_b:>10.5f} {ov_s:>10.5f} "
+              f"{ov_i:>+7.1f}% {'':>6} {total_n:>7}")
+        print(f"{'Ensembl':<8} {'':8} {'':>10} {ov_e:>10.5f} "
+              f"{ov_ei:>+7.1f}% {'':>6} {total_n:>7}")
 
 
 def evaluate_archive_on_orders(archive, env, baseline_model, orders_df,
