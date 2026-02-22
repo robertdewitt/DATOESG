@@ -4,7 +4,6 @@ __pycache__/
 *.pkl
 *.zip
 Gym/._mana_data
-.DS_Store/
 Gym/.DS_Store/
 .vscode/
 Gym/.venv/
