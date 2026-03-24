@@ -1,8 +1,13 @@
 # Project-Code
 
-This project is for the Msc. Thesis in Machine Learning and Data Science at Imperial in 2025, written by Robert N de Witt.
+This is the code for the following paper:
 
-There is an accompanying paper here: (link to be provided)
+Diverse Approaches to Optimal Execution Schedule Generation
+Robert de Witt, Mikko S. Pakkanen
+We present the first application of MAP-Elites, a quality-diversity algorithm, to trade execution. Rather than searching for a single optimal policy, MAP-Elites generates a diverse portfolio of regime-specialist strategies indexed by liquidity and volatility conditions. Individual specialists achieve 8-10% performance improvements within their behavioural niches, while other cells show degradation, suggesting opportunities for ensemble approaches that combine improved specialists with the baseline PPO policy. Results indicate that quality-diversity methods offer promise for regime-adaptive execution, though substantial computational resources per behavioural cell may be required for robust specialist development across all market conditions.
+To ensure experimental integrity, we develop a calibrated Gymnasium environment focused on order scheduling rather than tactical placement decisions. The simulator features a transient impact model with exponential decay and square-root volume scaling, fit to 400+ U.S. equities with R2>0.02 out-of-sample. Within this environment, two Proximal Policy Optimization architectures - both MLP and CNN feature extractors - demonstrate substantial improvements over industry baselines, with the CNN variant achieving 2.13 bps arrival slippage versus 5.23 bps for VWAP on 4,900 out-of-sample orders ($21B notional). These results validate both the simulation realism and provide strong single-policy baselines for quality-diversity methods.
+
+https://arxiv.org/abs/2601.22113
 
 To reproduce the results, the parquet version of the data is provided so one can run the models and play them back. 
 
