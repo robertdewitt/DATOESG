@@ -1,4 +1,4 @@
-# Project-Code
+# Diverse Approaches to Optimal Execution Schedule Generation Codebase
 
 This is the code for the following paper:
 
